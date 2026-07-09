@@ -5,21 +5,24 @@ use crate::store;
 use axum::{
     extract::{Multipart, Path, State},
     http::{header, StatusCode},
-    response::{IntoResponse, Response},
+    response::{sse::Event, sse::KeepAlive, sse::Sse, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use caliper_core::{Artifact, Job, JobStatus};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/jobs", post(create_job).get(list_jobs))
         .route("/v1/jobs/:id", get(get_job).delete(cancel_job))
+        .route("/v1/jobs/:id/events", get(job_events))
         .route("/v1/jobs/:id/artifacts", get(list_artifacts))
         .route("/v1/jobs/:id/artifacts/:name", get(get_artifact))
         .with_state(state)
@@ -206,4 +209,57 @@ fn content_type(name: &str) -> &'static str {
         Some("gz") => "application/gzip",
         _ => "application/octet-stream",
     }
+}
+
+/// SSE 进度流：GET /v1/jobs/:id/events
+/// - `event: progress`：状态/阶段变化时推送快照 {status, stage, updated_at}
+/// - `event: done`：进入终态时推送完整 Job
+/// - `event: error`：任务不存在或超时
+async fn job_events(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let s = async_stream::stream! {
+        let mut last: Option<(String, String)> = None;
+        // 上限约 1 小时（4500 × 800ms），防止僵尸流
+        for _ in 0..4500 {
+            match state.get_job(&id).await {
+                None => {
+                    yield Ok::<_, Infallible>(
+                        Event::default().event("error").data("\"job not found\""),
+                    );
+                    return;
+                }
+                Some(j) => {
+                    let sig = (j.status.as_str().to_string(), j.stage.clone());
+                    if last.as_ref() != Some(&sig) {
+                        let snap = serde_json::to_string(&json!({
+                            "status": j.status.as_str(),
+                            "stage": j.stage,
+                            "updated_at": j.updated_at,
+                        }))
+                        .unwrap_or_else(|_| "{}".into());
+                        yield Ok::<_, Infallible>(
+                            Event::default().event("progress").data(snap),
+                        );
+                        last = Some(sig);
+                    }
+                    if j.status.is_terminal() {
+                        let full = serde_json::to_string(&j).unwrap_or_else(|_| "{}".into());
+                        yield Ok::<_, Infallible>(
+                            Event::default().event("done").data(full),
+                        );
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        }
+        yield Ok::<_, Infallible>(Event::default().event("error").data("\"timeout\""));
+    };
+    Sse::new(s).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    )
 }

@@ -6,6 +6,8 @@ use crate::store;
 use crate::tools;
 use anyhow::{Context, Result};
 use caliper_core::*;
+use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -61,13 +63,7 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
     let lock = state.device_lock(dev).await;
     let _guard = lock.lock().await;
 
-    // ---------- 1. ATC 极限编译 ----------
-    state
-        .update_job(id, |j| {
-            j.status = JobStatus::Compiling;
-            j.stage = "atc: 极限编译中".into();
-        })
-        .await;
+    // ---------- 1. ATC 极限编译（带编译缓存）----------
     let soc = spec
         .soc_version
         .clone()
@@ -78,26 +74,85 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
     let onnx = store::onnx_path(&workdir);
     let om_base = store::om_base(&workdir);
     let om = store::om_path(&workdir);
-    let atc_cmd = tools::build_atc_cmd(
-        &onnx,
-        &om_base,
-        &soc,
-        spec.input_shape.as_deref(),
-        spec.extra_atc_flags.as_deref(),
+
+    // ---------- 1. ATC 极限编译（带编译缓存）----------
+    // 缓存键 = sha256( onnx_sha256 | soc | input_shape | extra_atc_flags )。
+    // 设备串行锁保证同一时刻只有一个 job 在编译，无并发写缓存的竞争。
+    let onnx_sha = sha256_file(&onnx)?;
+    let composite = format!(
+        "{}\n{}\n{}\n{}",
+        onnx_sha,
+        soc,
+        spec.input_shape.as_deref().unwrap_or(""),
+        spec.extra_atc_flags.as_deref().unwrap_or(""),
     );
-    let t0 = Instant::now();
-    tools::run_logged(
-        &cann.set_env,
-        &atc_cmd,
-        Some(&workdir),
-        Some(&store::atc_log(&workdir)),
-        "atc",
-    )
-    .await?;
-    let compile = CompileResult {
-        duration_ms: t0.elapsed().as_millis() as u64,
-        soc_version: soc.clone(),
-        om_path: om.to_string_lossy().into_owned(),
+    let cache_key = hex_sha256(composite.as_bytes());
+    let cache_om_path = store::cache_om(&state.storage, &cache_key);
+    let cached = !spec.no_cache && cache_om_path.exists();
+
+    let compile = if cached {
+        state
+            .update_job(id, |j| {
+                j.status = JobStatus::Compiling;
+                j.stage = "命中编译缓存，跳过 ATC".into();
+            })
+            .await;
+        std::fs::copy(&cache_om_path, &om)
+            .with_context(|| format!("从缓存复制 OM 失败: {}", cache_om_path.display()))?;
+        CompileResult {
+            duration_ms: 0,
+            soc_version: soc.clone(),
+            om_path: om.to_string_lossy().into_owned(),
+            cached: true,
+        }
+    } else {
+        state
+            .update_job(id, |j| {
+                j.status = JobStatus::Compiling;
+                j.stage = "atc: 极限编译中".into();
+            })
+            .await;
+        let atc_cmd = tools::build_atc_cmd(
+            &onnx,
+            &om_base,
+            &soc,
+            spec.input_shape.as_deref(),
+            spec.extra_atc_flags.as_deref(),
+        );
+        let t0 = Instant::now();
+        tools::run_logged(
+            &cann.set_env,
+            &atc_cmd,
+            Some(&workdir),
+            Some(&store::atc_log(&workdir)),
+            "atc",
+        )
+        .await?;
+        let cr = CompileResult {
+            duration_ms: t0.elapsed().as_millis() as u64,
+            soc_version: soc.clone(),
+            om_path: om.to_string_lossy().into_owned(),
+            cached: false,
+        };
+        // 写入缓存（best-effort，失败不影响任务结果）
+        if !spec.no_cache {
+            let _ = std::fs::create_dir_all(store::cache_dir(&state.storage, &cache_key));
+            if std::fs::copy(&om, &cache_om_path).is_ok() {
+                let manifest = json!({
+                    "key": &cache_key,
+                    "source_sha256": &onnx_sha,
+                    "soc_version": &soc,
+                    "input_shape": spec.input_shape,
+                    "extra_atc_flags": spec.extra_atc_flags,
+                    "om_size": std::fs::metadata(&om).map(|m| m.len()).unwrap_or(0),
+                });
+                let _ = std::fs::write(
+                    store::cache_manifest(&state.storage, &cache_key),
+                    serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
+                );
+            }
+        }
+        cr
     };
     if state.is_cancelled(id).await {
         mark_cancelled(&state, id).await;
@@ -213,4 +268,16 @@ async fn tar_msprof(workdir: &Path, tgz: &Path) -> Result<()> {
         anyhow::bail!("tar msprof 失败 exit={:?}", status.code());
     }
     Ok(())
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let data =
+        std::fs::read(path).with_context(|| format!("读取文件失败: {}", path.display()))?;
+    Ok(hex_sha256(&data))
 }

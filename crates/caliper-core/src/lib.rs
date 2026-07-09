@@ -76,6 +76,9 @@ pub struct CompileResult {
     pub duration_ms: u64,
     pub soc_version: String,
     pub om_path: String,
+    /// 是否命中编译缓存（命中时跳过 ATC，duration_ms 为 0）。
+    #[serde(default)]
+    pub cached: bool,
 }
 
 /// msprof 取证结果（仅原始产物 + 路径，不做服务端解析）。
@@ -164,6 +167,9 @@ pub struct JobSpec {
     /// 附加 atc 参数（原样拼接），高级用途。
     #[serde(default)]
     pub extra_atc_flags: Option<String>,
+    /// 跳过编译缓存，强制重新 ATC 编译。
+    #[serde(default)]
+    pub no_cache: bool,
 }
 
 fn default_iters() -> u32 {
@@ -189,6 +195,7 @@ impl Default for JobSpec {
             device_id: default_device(),
             msprof_iters: default_msprof_iters(),
             extra_atc_flags: None,
+            no_cache: false,
         }
     }
 }

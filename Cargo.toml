@@ -9,8 +9,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
-repository = "https://example.invalid/caliper"
+license = "LGPL-3.0"
+repository = "https://github.com/iMMIQ/caliper"
 
 # Shared dependency versions, referenced from crate manifests via `<name>.workspace = true`.
 [workspace.dependencies]

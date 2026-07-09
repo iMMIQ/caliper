@@ -48,6 +48,20 @@ pub fn msprof_tgz(dir: &Path) -> PathBuf {
     dir.join("msprof.tar.gz")
 }
 
+// ---- 编译缓存：<storage>/cache/<key>/{model.om, manifest.json} ----
+pub fn cache_root(storage: &Path) -> PathBuf {
+    storage.join("cache")
+}
+pub fn cache_dir(storage: &Path, key: &str) -> PathBuf {
+    cache_root(storage).join(key)
+}
+pub fn cache_om(storage: &Path, key: &str) -> PathBuf {
+    cache_dir(storage, key).join("model.om")
+}
+pub fn cache_manifest(storage: &Path, key: &str) -> PathBuf {
+    cache_dir(storage, key).join("manifest.json")
+}
+
 /// 枚举工作目录下已知产物（仅存在的）。
 pub fn list_artifacts(dir: &Path) -> Vec<Artifact> {
     let entries: [(PathBuf, &str, ArtifactKind); 7] = [

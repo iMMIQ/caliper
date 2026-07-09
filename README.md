@@ -4,6 +4,8 @@
 
 面向昇腾（Ascend）NPU 的 ONNX 模型自动化性能表征服务。
 
+> 许可证：**LGPL-3.0**（见 [LICENSE](LICENSE)）
+
 ## 流水线
 
 ```
@@ -51,6 +53,7 @@ curl -OJ http://127.0.0.1:7878/v1/jobs/<job_id>/artifacts/msprof.tar.gz
 | --- | --- | --- |
 | `POST` | `/v1/jobs` | multipart：`spec`(JSON) + `onnx`(文件)，返回 `job_id` |
 | `GET` | `/v1/jobs/{id}` | 任务状态与结果 |
+| `GET` | `/v1/jobs/{id}/events` | SSE 进度流（见下） |
 | `GET` | `/v1/jobs` | 任务列表 |
 | `GET` | `/v1/jobs/{id}/artifacts` | 产物清单 |
 | `GET` | `/v1/jobs/{id}/artifacts/{name}` | 下载产物（`model.om`/`atc.log`/`bench.json`/`msprof.tar.gz`/`result.json`） |
@@ -68,5 +71,32 @@ curl -OJ http://127.0.0.1:7878/v1/jobs/<job_id>/artifacts/msprof.tar.gz
   "device_id": 0,
   "msprof_iters": 10,
   "extra_atc_flags": ""           // 可选，附加 atc 参数
+  "no_cache": false               // 可选，true 则强制重新 ATC 编译、不读不写缓存
 }
+```
+
+## 编译缓存
+
+ATC 编译按 `sha256(onnx) + soc_version + input_shape + extra_atc_flags` 缓存到 `storage/cache/<key>/`。相同输入的二次提交直接复用 OM，跳过 ATC：
+
+- `JobResult.compile.cached` 标识是否命中（命中时 `duration_ms = 0`）
+- 设备串行锁保证同一时刻只有一个 job 在编译，无并发写竞争
+- `spec.no_cache = true` 可强制重编；删除 `storage/cache/` 即清空
+
+## SSE 进度
+
+`GET /v1/jobs/{id}/events` 以 Server-Sent Events 推送进度：
+
+```text
+event: progress
+data: {"status":"benchmarking","stage":"caliper-runner: 基准中","updated_at":"..."}
+
+event: done            # 进入终态时，推送完整 Job（含 result）
+data: {"id":"...","status":"succeeded","result":{...}}
+
+event: error           # 任务不存在或流超时（上限约 1 小时）
+```
+
+```bash
+curl -N http://127.0.0.1:7878/v1/jobs/<job_id>/events
 ```
