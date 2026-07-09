@@ -1,0 +1,22 @@
+# Caliper 默认配置。运行时优先级：命令行参数 > 环境变量 > 本文件 > 代码默认值。
+# CANN 工具链默认自动发现（按 ASCEND_TOOLKIT_HOME / 常见安装路径），无需在此写死路径。
+
+[server]
+bind = "0.0.0.0:7878"
+
+[storage]
+dir = "storage"
+
+[run]
+device_id = 0
+iters = 100
+warmup = 10
+msprof_iters = 10
+# msprof 采集这几次推理的执行数据（取证样本数，远小于 iters）
+
+[cann]
+# 以下均可留空，留空即自动发现：
+# home = ""              # CANN 工具链根目录（含 set_env.sh / bin/atc）
+# soc_version = ""       # 目标 SoC，如 Ascend310P3；留空则从 npu-smi 推断
+# runner = ""            # caliper-runner 可执行文件路径；留空则用同目录下的同名二进制
+# libascendcl = ""       # libascendcl.so 绝对路径；留空则在 home 下搜索

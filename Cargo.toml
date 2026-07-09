@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/caliper-core",
+    "crates/caliper-runner",
+    "crates/caliper",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://example.invalid/caliper"
+
+# Shared dependency versions, referenced from crate manifests via `<name>.workspace = true`.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+caliper-core = { path = "crates/caliper-core" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

@@ -1,0 +1,13 @@
+[package]
+name = "caliper-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libloading = "0.8"
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+caliper-core.workspace = true

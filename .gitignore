@@ -1,0 +1,12 @@
+# Rust 构建产物
+/target
+
+# 运行时任务数据（上传的 onnx / 编译产物 / msprof 等）
+/storage
+
+# 备份与临时
+*.tar.gz
+*.swp
+.DS_Store
+# CANN 子进程往 CWD 丢的副产品（正常应落在 storage/ 的 job 目录里）
+fusion_result.json
