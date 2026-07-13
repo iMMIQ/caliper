@@ -30,7 +30,12 @@ struct Captured {
     code: Option<i32>,
 }
 
-async fn run_capture(set_env: &Path, inner: &str, cwd: Option<&Path>, stage: &str) -> Result<Captured> {
+async fn run_capture(
+    set_env: &Path,
+    inner: &str,
+    cwd: Option<&Path>,
+    stage: &str,
+) -> Result<Captured> {
     let mut cmd = sourced(set_env, inner, cwd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let out = cmd

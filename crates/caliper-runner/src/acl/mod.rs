@@ -7,8 +7,8 @@ use anyhow::{bail, Result};
 use std::ffi::CString;
 use std::path::Path;
 
-use ffi::{Error, Ffi, Handle, IODims, MEM_HUGE_FIRST, OK};
 use caliper_core::IoDesc;
+use ffi::{Error, Ffi, Handle, IODims, MEM_HUGE_FIRST, OK};
 
 /// 已加载模型的资源句柄，用于卸载时按序释放。
 struct ModelHandles {
@@ -71,13 +71,14 @@ impl Acl {
             .map_err(|e| anyhow::anyhow!("OM 路径含内部 NUL: {e}"))?;
 
         let mut model_id: u32 = 0;
-        check(
-            "aclmdlLoadFromFile",
-            unsafe { (self.f.mdl_load_from_file)(path_c.as_ptr() as *const u8, &mut model_id) },
-        )?;
+        check("aclmdlLoadFromFile", unsafe {
+            (self.f.mdl_load_from_file)(path_c.as_ptr() as *const u8, &mut model_id)
+        })?;
 
         let desc = unsafe { (self.f.mdl_create_desc)() };
-        check("aclmdlGetDesc", unsafe { (self.f.mdl_get_desc)(desc, model_id) })?;
+        check("aclmdlGetDesc", unsafe {
+            (self.f.mdl_get_desc)(desc, model_id)
+        })?;
 
         let n_in = unsafe { (self.f.mdl_get_num_inputs)(desc) };
         let n_out = unsafe { (self.f.mdl_get_num_outputs)(desc) };
@@ -89,7 +90,8 @@ impl Acl {
         let inputs = self.build_side(desc, n_in, true, input_ds, &mut data_bufs, &mut dev_ptrs)?;
 
         let output_ds = unsafe { (self.f.mdl_create_dataset)() };
-        let outputs = self.build_side(desc, n_out, false, output_ds, &mut data_bufs, &mut dev_ptrs)?;
+        let outputs =
+            self.build_side(desc, n_out, false, output_ds, &mut data_bufs, &mut dev_ptrs)?;
 
         self.model = Some(ModelHandles {
             id: model_id,
@@ -120,25 +122,25 @@ impl Acl {
                 unsafe { (self.f.mdl_get_output_size_by_index)(desc, i) }
             };
             if size == 0 {
-                bail!("模型 {side} buffer[{i}] size=0（可能为动态形状模型，暂不支持）", side = if is_input {"input"} else {"output"});
+                bail!(
+                    "模型 {side} buffer[{i}] size=0（可能为动态形状模型，暂不支持）",
+                    side = if is_input { "input" } else { "output" }
+                );
             }
             let mut dev: *mut std::ffi::c_void = std::ptr::null_mut();
-            check(
-                "aclrtMalloc",
-                unsafe { (self.f.rt_malloc)(&mut dev, size, MEM_HUGE_FIRST) },
-            )?;
+            check("aclrtMalloc", unsafe {
+                (self.f.rt_malloc)(&mut dev, size, MEM_HUGE_FIRST)
+            })?;
             if is_input {
                 // 输入零填充即可（量时延不关心正确性）
-                check(
-                    "aclrtMemset",
-                    unsafe { (self.f.rt_memset)(dev, size, 0, size) },
-                )?;
+                check("aclrtMemset", unsafe {
+                    (self.f.rt_memset)(dev, size, 0, size)
+                })?;
             }
             let buf = unsafe { (self.f.create_data_buffer)(dev, size) };
-            check(
-                "aclmdlAddDatasetBuffer",
-                unsafe { (self.f.mdl_add_dataset_buffer)(dataset, buf) },
-            )?;
+            check("aclmdlAddDatasetBuffer", unsafe {
+                (self.f.mdl_add_dataset_buffer)(dataset, buf)
+            })?;
             data_bufs.push(buf);
             dev_ptrs.push(dev);
 
@@ -169,32 +171,33 @@ impl Acl {
             .model
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("execute 前未加载模型"))?;
-        check(
-            "aclmdlExecute",
-            unsafe { (self.f.mdl_execute)(m.id, m.input_ds, m.output_ds) },
-        )
+        check("aclmdlExecute", unsafe {
+            (self.f.mdl_execute)(m.id, m.input_ds, m.output_ds)
+        })
     }
 
     /// 卸载模型并释放资源（best-effort，忽略个别错误以尽量清理）。
     pub fn unload_model(&mut self) {
         if let Some(m) = self.model.take() {
             for b in m.data_bufs {
-                let _ = check("aclDestroyDataBuffer", unsafe { (self.f.destroy_data_buffer)(b) });
+                let _ = check("aclDestroyDataBuffer", unsafe {
+                    (self.f.destroy_data_buffer)(b)
+                });
             }
             for p in m.dev_ptrs {
                 if !p.is_null() {
                     let _ = check("aclrtFree", unsafe { (self.f.rt_free)(p) });
                 }
             }
-            let _ = check(
-                "aclmdlDestroyDataset",
-                unsafe { (self.f.mdl_destroy_dataset)(m.input_ds) },
-            );
-            let _ = check(
-                "aclmdlDestroyDataset",
-                unsafe { (self.f.mdl_destroy_dataset)(m.output_ds) },
-            );
-            let _ = check("aclmdlDestroyDesc", unsafe { (self.f.mdl_destroy_desc)(m.desc) });
+            let _ = check("aclmdlDestroyDataset", unsafe {
+                (self.f.mdl_destroy_dataset)(m.input_ds)
+            });
+            let _ = check("aclmdlDestroyDataset", unsafe {
+                (self.f.mdl_destroy_dataset)(m.output_ds)
+            });
+            let _ = check("aclmdlDestroyDesc", unsafe {
+                (self.f.mdl_destroy_desc)(m.desc)
+            });
             let _ = check("aclmdlUnload", unsafe { (self.f.mdl_unload)(m.id) });
         }
     }

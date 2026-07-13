@@ -160,8 +160,9 @@ pub struct JobSpec {
     pub iters: u32,
     #[serde(default = "default_warmup")]
     pub warmup: u32,
-    #[serde(default = "default_device")]
-    pub device_id: i32,
+    /// 指定设备 ID；留空则由服务从空闲设备池自动分配。
+    #[serde(default)]
+    pub device_id: Option<i32>,
     #[serde(default = "default_msprof_iters")]
     pub msprof_iters: u32,
     /// 附加 atc 参数（原样拼接），高级用途。
@@ -178,9 +179,6 @@ fn default_iters() -> u32 {
 fn default_warmup() -> u32 {
     10
 }
-fn default_device() -> i32 {
-    0
-}
 fn default_msprof_iters() -> u32 {
     10
 }
@@ -192,7 +190,7 @@ impl Default for JobSpec {
             input_shape: None,
             iters: default_iters(),
             warmup: default_warmup(),
-            device_id: default_device(),
+            device_id: None,
             msprof_iters: default_msprof_iters(),
             extra_atc_flags: None,
             no_cache: false,
@@ -219,6 +217,9 @@ pub struct Job {
     /// 上传的原始 onnx 文件名。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub onnx_name: Option<String>,
+    /// 调度器实际分配的设备；排队阶段为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_device_id: Option<i32>,
 }
 
 #[cfg(test)]
@@ -249,7 +250,7 @@ mod tests {
         let s = JobSpec::default();
         assert_eq!(s.iters, 100);
         assert_eq!(s.warmup, 10);
-        assert_eq!(s.device_id, 0);
+        assert_eq!(s.device_id, None);
         assert!(s.soc_version.is_none());
     }
 

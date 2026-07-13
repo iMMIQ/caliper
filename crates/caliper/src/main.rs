@@ -3,6 +3,7 @@
 mod api;
 mod cann;
 mod config;
+mod device;
 mod pipeline;
 mod state;
 mod store;
@@ -38,7 +39,10 @@ async fn main() -> Result<()> {
         Some(p) => p.clone(),
         None => {
             let exe = std::env::current_exe()?;
-            let dir = exe.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+            let dir = exe
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."));
             dir.join("caliper-runner")
         }
     };
@@ -59,17 +63,26 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(storage.join("jobs"))?;
     info!(storage = %storage.display(), "存储目录");
 
-    if let Some(s) = cfg
-        .soc_version
-        .clone()
-        .or_else(|| cann::infer_soc(cfg.device_id))
-    {
+    let devices = device::DeviceManager::new(
+        cfg.device_ids.clone(),
+        cfg.device_lock_dir.clone(),
+        cfg.device_poll_interval_ms,
+        cfg.require_idle_device,
+    )?;
+    info!(devices = ?devices.device_ids(), lock_dir = %cfg.device_lock_dir.display(), "NPU 独占调度器已启用");
+
+    if let Some(s) = cfg.soc_version.clone().or_else(|| {
+        devices
+            .device_ids()
+            .first()
+            .and_then(|device| cann::infer_soc(*device))
+    }) {
         info!(soc = %s, "目标 SoC（可被 JobSpec 覆盖）");
     } else {
         info!("未能从 npu-smi 推断 SoC，需在 JobSpec 中指定 soc_version");
     }
 
-    let state = AppState::new(cfg, cann, runner, storage);
+    let state = AppState::new(cfg, cann, devices, runner, storage);
     let app = api::router(state);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;

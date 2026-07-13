@@ -155,11 +155,13 @@ pub fn infer_soc(_device: i32) -> Option<String> {
     for line in text.lines() {
         for tok in line.split_whitespace() {
             // 形如 310P3 / 910B1 / 310B4：以数字开头、含字母、长度 ≤ 8
-            let starts_digit = tok.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false);
-            let has_alpha = tok.chars().any(|c| c.is_ascii_alphabetic());
-            let no_punct = tok
+            let starts_digit = tok
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric())
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false);
+            let has_alpha = tok.chars().any(|c| c.is_ascii_alphabetic());
+            let no_punct = tok.chars().all(|c| c.is_ascii_alphanumeric())
                 && tok.chars().any(|c| c.is_ascii_alphabetic());
             if starts_digit && has_alpha && no_punct && tok.len() <= 8 {
                 return Some(format!("Ascend{}", tok));

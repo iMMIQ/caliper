@@ -22,7 +22,7 @@
 | --- | --- |
 | `caliper-core` | 共享类型（JobSpec / Job / 统计结果 / 错误） |
 | `caliper-runner` | ACL FFI + 一次性基准二进制（也可被 msprof 包裹） |
-| `caliper` | axum 服务：CANN 自动发现、任务编排、设备串行、API |
+| `caliper` | axum 服务：CANN 自动发现、任务编排、多设备独占调度、API |
 
 ## 构建
 
@@ -68,19 +68,46 @@ curl -OJ http://127.0.0.1:7878/v1/jobs/<job_id>/artifacts/msprof.tar.gz
   "input_shape": "input:1,3,224,224", // 可选，动态形状模型需提供
   "iters": 100,
   "warmup": 10,
-  "device_id": 0,
+  "device_id": null,            // 可选；null 自动选择空闲卡，整数则等待指定卡
   "msprof_iters": 10,
-  "extra_atc_flags": ""           // 可选，附加 atc 参数
+  "extra_atc_flags": "",          // 可选，附加 atc 参数
   "no_cache": false               // 可选，true 则强制重新 ATC 编译、不读不写缓存
 }
 ```
+
+## 多卡独占调度
+
+任务提交后会遍历允许的设备池，对每张卡执行两层检查：
+
+1. 对目标机上的设备锁文件获取非阻塞 `flock`。同机的多个 Caliper 进程、多个用户只要使用同一 `lock_dir`，就不会拿到同一张卡。
+2. 持锁后检查 `npu-smi info` 的进程表。卡上已有未遵守 Caliper 锁协议的进程时拒绝调度；无法识别输出时默认 fail closed。
+
+租约覆盖 ATC、benchmark 和 msprof 的完整任务生命周期。任务正常结束、失败或服务进程退出时，内核随文件描述符关闭自动释放租约。没有空闲卡的任务保持 `queued`，`stage` 会给出等待原因；`assigned_device_id` 在拿到卡后记录实际卡号。显式提交 `device_id` 时只等待该卡，省略或设为 `null` 时轮转选择任意空闲卡。
+
+```toml
+[devices]
+ids = [0, 1, 2, 3]                 # 留空则自动发现
+lock_dir = "/run/lock/caliper"     # 所有 Caliper 实例必须完全一致
+poll_interval_ms = 1000
+require_idle = true
+```
+
+### 多人机器的强隔离边界
+
+`flock` 是协作式租约，`npu-smi` 是提交时检查。只要普通用户仍可直接打开 `/dev/davinci*`，任何用户都能绕过调度器并在测量中途启动进程，应用层无法给出严格独占保证。要求性能结果可信时，应把 Caliper 部署成目标机上的单一服务账号：
+
+- 只有 Caliper 服务账号属于有权访问 Ascend 设备节点的用户组，其他用户只调用 HTTP API。
+- 使用管理员预建、不可由普通用户删除的 `lock_dir`；若还运行多个 Caliper 实例，则预建每张卡的 `device-<id>.lock` 并授予这些实例共同的组读写权限。
+- 保持 `require_idle = true`，用于发现服务启动前已经存在的外部任务或配置错误。
+
+这时权限层阻止绕过，文件租约负责多个 Caliper 实例之间的互斥，二者共同提供严格的一卡一任务约束。容器部署也应只把调度器分配的单个设备节点映射进任务容器，不能把全部 `/dev/davinci*` 暴露给任意用户容器。
 
 ## 编译缓存
 
 ATC 编译按 `sha256(onnx) + soc_version + input_shape + extra_atc_flags` 缓存到 `storage/cache/<key>/`。相同输入的二次提交直接复用 OM，跳过 ATC：
 
 - `JobResult.compile.cached` 标识是否命中（命中时 `duration_ms = 0`）
-- 设备串行锁保证同一时刻只有一个 job 在编译，无并发写竞争
+- 缓存文件通过临时文件原子发布，多卡并发编译不会暴露半写入的 OM
 - `spec.no_cache = true` 可强制重编；删除 `storage/cache/` 即清空
 
 ## SSE 进度

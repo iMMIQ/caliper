@@ -1,6 +1,7 @@
 //! 任务流水线编排：acquire 设备锁 → ATC 极限编译 → caliper-runner 基准 → msprof 取证 → 汇总。
 //! 设备相关步骤全程持锁，保证同一设备串行。
 
+use crate::device::{DeviceLease, TryAcquire};
 use crate::state::AppState;
 use crate::store;
 use crate::tools;
@@ -18,12 +19,19 @@ pub async fn run_pipeline(state: Arc<AppState>, job_id: String) {
     let res = run_inner(state.clone(), &job_id).await;
     match res {
         Ok(()) => {
-            state
-                .update_job(&job_id, |j| {
-                    j.status = JobStatus::Succeeded;
-                    j.stage = "完成".into();
-                })
-                .await;
+            let cancelled = state
+                .get_job(&job_id)
+                .await
+                .map(|j| j.status == JobStatus::Cancelled)
+                .unwrap_or(false);
+            if !cancelled {
+                state
+                    .update_job(&job_id, |j| {
+                        j.status = JobStatus::Succeeded;
+                        j.stage = "完成".into();
+                    })
+                    .await;
+            }
         }
         Err(e) => {
             let cur = state
@@ -53,17 +61,18 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
     let workdir = PathBuf::from(&job.workdir);
     let spec = job.spec.clone();
     let cann = state.cann.clone();
-    let dev = spec.device_id;
 
     if state.is_cancelled(id).await {
         return Ok(());
     }
 
-    // 同一设备串行
-    let lock = state.device_lock(dev).await;
-    let _guard = lock.lock().await;
+    // 租约从选卡成功一直持有到 benchmark 和 msprof 全部结束。文件描述符关闭时
+    // flock 由内核释放，因此正常返回、错误和进程崩溃都不会遗留死锁。
+    let Some(lease) = acquire_device(&state, id, spec.device_id).await? else {
+        return Ok(());
+    };
+    let dev = lease.device_id();
 
-    // ---------- 1. ATC 极限编译（带编译缓存）----------
     let soc = spec
         .soc_version
         .clone()
@@ -77,7 +86,7 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
 
     // ---------- 1. ATC 极限编译（带编译缓存）----------
     // 缓存键 = sha256( onnx_sha256 | soc | input_shape | extra_atc_flags )。
-    // 设备串行锁保证同一时刻只有一个 job 在编译，无并发写缓存的竞争。
+    // 缓存最终文件通过 rename 原子发布，允许不同设备上的任务并发编译。
     let onnx_sha = sha256_file(&onnx)?;
     let composite = format!(
         "{}\n{}\n{}\n{}",
@@ -134,10 +143,14 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
             om_path: om.to_string_lossy().into_owned(),
             cached: false,
         };
-        // 写入缓存（best-effort，失败不影响任务结果）
+        // 先写任务专属临时文件再 rename，避免多卡并发任务观察到半写入的缓存。
         if !spec.no_cache {
             let _ = std::fs::create_dir_all(store::cache_dir(&state.storage, &cache_key));
-            if std::fs::copy(&om, &cache_om_path).is_ok() {
+            let cache_tmp =
+                store::cache_dir(&state.storage, &cache_key).join(format!("model.{id}.tmp"));
+            if std::fs::copy(&om, &cache_tmp).is_ok()
+                && std::fs::rename(&cache_tmp, &cache_om_path).is_ok()
+            {
                 let manifest = json!({
                     "key": &cache_key,
                     "source_sha256": &onnx_sha,
@@ -146,10 +159,18 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
                     "extra_atc_flags": spec.extra_atc_flags,
                     "om_size": std::fs::metadata(&om).map(|m| m.len()).unwrap_or(0),
                 });
-                let _ = std::fs::write(
-                    store::cache_manifest(&state.storage, &cache_key),
+                let manifest_path = store::cache_manifest(&state.storage, &cache_key);
+                let manifest_tmp = manifest_path.with_extension(format!("{id}.tmp"));
+                if std::fs::write(
+                    &manifest_tmp,
                     serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
-                );
+                )
+                .is_ok()
+                {
+                    let _ = std::fs::rename(manifest_tmp, manifest_path);
+                }
+            } else {
+                let _ = std::fs::remove_file(cache_tmp);
             }
         }
         cr
@@ -203,14 +224,8 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
     let mi = spec.msprof_iters.min(spec.iters.max(1));
     let msprof_out = store::msprof_dir(&workdir);
     let _ = std::fs::remove_dir_all(&msprof_out);
-    let msprof_cmd = tools::build_msprof_cmd(
-        &state.runner,
-        &om,
-        dev,
-        mi,
-        &cann.libascendcl,
-        &msprof_out,
-    );
+    let msprof_cmd =
+        tools::build_msprof_cmd(&state.runner, &om, dev, mi, &cann.libascendcl, &msprof_out);
     let t1 = Instant::now();
     tools::run_logged(
         &cann.set_env,
@@ -241,7 +256,47 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
         serde_json::to_vec_pretty(&result)?,
     );
     state.update_job(id, |j| j.result = Some(result)).await;
+    drop(lease);
     Ok(())
+}
+
+async fn acquire_device(
+    state: &Arc<AppState>,
+    id: &str,
+    requested: Option<i32>,
+) -> Result<Option<DeviceLease>> {
+    let candidates = state.devices.candidates(requested)?;
+    loop {
+        if state.is_cancelled(id).await {
+            return Ok(None);
+        }
+
+        match state.devices.try_acquire(candidates.clone()).await? {
+            TryAcquire::Acquired(lease) => {
+                let device_id = lease.device_id();
+                state
+                    .update_job(id, |j| {
+                        j.assigned_device_id = Some(device_id);
+                        j.stage = format!("已独占 NPU {device_id}");
+                    })
+                    .await;
+                return Ok(Some(lease));
+            }
+            TryAcquire::Unavailable(reason) => {
+                state
+                    .update_job(id, |j| {
+                        j.status = JobStatus::Queued;
+                        j.stage = if reason.is_empty() {
+                            "等待空闲 NPU".into()
+                        } else {
+                            format!("等待空闲 NPU（{reason}）")
+                        };
+                    })
+                    .await;
+            }
+        }
+        tokio::time::sleep(state.devices.poll_interval()).await;
+    }
 }
 
 async fn mark_cancelled(state: &Arc<AppState>, id: &str) {
@@ -277,7 +332,6 @@ fn hex_sha256(bytes: &[u8]) -> String {
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
-    let data =
-        std::fs::read(path).with_context(|| format!("读取文件失败: {}", path.display()))?;
+    let data = std::fs::read(path).with_context(|| format!("读取文件失败: {}", path.display()))?;
     Ok(hex_sha256(&data))
 }

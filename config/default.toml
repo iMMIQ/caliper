@@ -8,11 +8,16 @@ bind = "0.0.0.0:7878"
 dir = "storage"
 
 [run]
-device_id = 0
 iters = 100
 warmup = 10
 msprof_iters = 10
 # msprof 采集这几次推理的执行数据（取证样本数，远小于 iters）
+
+[devices]
+# ids = [0, 1, 2, 3]       # 留空时从 npu-smi / /dev/davinci* 自动发现
+lock_dir = "/tmp/caliper-device-locks" # 多实例/多用户必须使用同一目录；生产建议由管理员预建
+poll_interval_ms = 1000
+require_idle = true         # npu-smi 无法确认空闲时拒绝调度，避免污染结果
 
 [cann]
 # 以下均可留空，留空即自动发现：

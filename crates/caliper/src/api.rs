@@ -105,6 +105,7 @@ async fn create_job(
         result: None,
         workdir: workdir.to_string_lossy().into_owned(),
         onnx_name: onnx_name.clone(),
+        assigned_device_id: None,
     };
     state.insert_job(job).await;
     state.register_cancel(&id).await;
@@ -145,6 +146,7 @@ async fn list_jobs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 "stage": j.stage,
                 "created_at": j.created_at,
                 "onnx_name": j.onnx_name,
+                "assigned_device_id": j.assigned_device_id,
             })
         })
         .collect();

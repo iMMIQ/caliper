@@ -1,7 +1,8 @@
-//! 全局状态：任务表、按设备串行的锁、取消标志。
+//! 全局状态：任务表、跨进程设备调度器、取消标志。
 
 use crate::cann::Cann;
 use crate::config::Config;
+use crate::device::DeviceManager;
 use caliper_core::{Job, JobId, JobStatus};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,22 +13,28 @@ use tokio::sync::Mutex;
 pub struct AppState {
     pub cfg: Arc<Config>,
     pub cann: Arc<Cann>,
+    pub devices: Arc<DeviceManager>,
     pub runner: PathBuf,
     pub storage: PathBuf,
     pub jobs: Mutex<HashMap<JobId, Job>>,
-    pub device_locks: Mutex<HashMap<i32, Arc<Mutex<()>>>>,
     pub cancel_flags: Mutex<HashMap<JobId, Arc<AtomicBool>>>,
 }
 
 impl AppState {
-    pub fn new(cfg: Config, cann: Cann, runner: PathBuf, storage: PathBuf) -> Arc<Self> {
+    pub fn new(
+        cfg: Config,
+        cann: Cann,
+        devices: DeviceManager,
+        runner: PathBuf,
+        storage: PathBuf,
+    ) -> Arc<Self> {
         Arc::new(Self {
             cfg: Arc::new(cfg),
             cann: Arc::new(cann),
+            devices: Arc::new(devices),
             runner,
             storage,
             jobs: Mutex::new(HashMap::new()),
-            device_locks: Mutex::new(HashMap::new()),
             cancel_flags: Mutex::new(HashMap::new()),
         })
     }
@@ -43,7 +50,7 @@ impl AppState {
     pub async fn list_jobs(&self) -> Vec<Job> {
         let g = self.jobs.lock().await;
         let mut v: Vec<Job> = g.values().cloned().collect();
-        v.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        v.sort_by_key(|job| job.created_at);
         v
     }
 
@@ -53,13 +60,6 @@ impl AppState {
             f(j);
             j.updated_at = chrono::Utc::now();
         }
-    }
-
-    pub async fn device_lock(&self, dev: i32) -> Arc<Mutex<()>> {
-        let mut g = self.device_locks.lock().await;
-        g.entry(dev)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
     }
 
     pub async fn register_cancel(&self, id: &str) -> Arc<AtomicBool> {
