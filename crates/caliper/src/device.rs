@@ -5,7 +5,7 @@
 
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -194,12 +194,10 @@ fn open_lock_file(lock_dir: &Path, device_id: i32) -> Result<File> {
 }
 
 fn discover_device_ids() -> Vec<i32> {
-    if let Ok(out) = Command::new("npu-smi").args(["info", "-l"]).output() {
-        if out.status.success() {
-            let ids = parse_device_list(&String::from_utf8_lossy(&out.stdout));
-            if !ids.is_empty() {
-                return ids;
-            }
+    if let Ok(mapping) = query_device_mapping() {
+        let ids = chip_logic_ids(&mapping);
+        if !ids.is_empty() {
+            return ids;
         }
     }
     let mut ids = Vec::new();
@@ -217,27 +215,62 @@ fn discover_device_ids() -> Vec<i32> {
     ids
 }
 
-fn parse_device_list(text: &str) -> Vec<i32> {
-    let mut ids = BTreeSet::new();
+fn query_device_mapping() -> Result<BTreeMap<(i32, i32), i32>> {
+    let out = Command::new("npu-smi")
+        .args(["info", "-m"])
+        .output()
+        .context("执行 npu-smi info -m 失败")?;
+    if !out.status.success() {
+        bail!("npu-smi info -m exit={:?}", out.status.code());
+    }
+    let mapping = parse_device_mapping(&String::from_utf8_lossy(&out.stdout));
+    if mapping.is_empty() {
+        bail!("npu-smi info -m 未返回 Chip Logic ID 映射");
+    }
+    Ok(mapping)
+}
+
+fn parse_device_mapping(text: &str) -> BTreeMap<(i32, i32), i32> {
+    let mut mapping = BTreeMap::new();
+    let mut in_mapping_table = false;
     for line in text.lines() {
         let lower = line.to_ascii_lowercase();
-        if !(lower.contains("npu id") || lower.contains("device id")) {
+        if lower.contains("npu id") && lower.contains("chip id") && lower.contains("chip logic id")
+        {
+            in_mapping_table = true;
             continue;
         }
-        if let Some(value) = line.split(':').nth(1) {
-            if let Some(id) = value
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse::<i32>().ok())
-            {
-                ids.insert(id);
-            }
+        if !in_mapping_table {
+            continue;
+        }
+
+        // `info -m` 的前三列依次为 NPU ID、Chip ID、Chip Logic ID。
+        // MCU 等非计算设备的 Chip Logic ID 为 `-`，自然会被忽略。
+        let columns: Vec<&str> = line
+            .split(|c: char| c.is_whitespace() || c == '|')
+            .filter(|column| !column.is_empty())
+            .collect();
+        let npu_id = columns.first().and_then(|value| value.parse::<i32>().ok());
+        let chip_id = columns.get(1).and_then(|value| value.parse::<i32>().ok());
+        let logic_id = columns.get(2).and_then(|value| value.parse::<i32>().ok());
+        if let (Some(npu_id), Some(chip_id), Some(logic_id)) = (npu_id, chip_id, logic_id) {
+            mapping.insert((npu_id, chip_id), logic_id);
         }
     }
-    ids.into_iter().collect()
+    mapping
+}
+
+fn chip_logic_ids(mapping: &BTreeMap<(i32, i32), i32>) -> Vec<i32> {
+    mapping
+        .values()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn busy_devices() -> Result<BTreeSet<i32>> {
+    let mapping = query_device_mapping()?;
     let out = Command::new("npu-smi")
         .arg("info")
         .output()
@@ -245,11 +278,11 @@ fn busy_devices() -> Result<BTreeSet<i32>> {
     if !out.status.success() {
         bail!("npu-smi info exit={:?}", out.status.code());
     }
-    parse_busy_devices(&String::from_utf8_lossy(&out.stdout))
+    parse_busy_devices(&String::from_utf8_lossy(&out.stdout), &mapping)
 }
 
-fn parse_busy_devices(text: &str) -> Result<BTreeSet<i32>> {
-    let mut busy = BTreeSet::new();
+fn parse_busy_devices(text: &str, mapping: &BTreeMap<(i32, i32), i32>) -> Result<BTreeSet<i32>> {
+    let mut busy_chips = BTreeSet::new();
     let mut in_process_table = false;
     let mut recognized = false;
     for line in text.lines() {
@@ -267,23 +300,34 @@ fn parse_busy_devices(text: &str) -> Result<BTreeSet<i32>> {
             continue;
         }
         let cols: Vec<&str> = line
-            .split('|')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .split(|c: char| c.is_whitespace() || c == '|')
+            .filter(|column| !column.is_empty())
             .collect();
         if cols.len() < 3 {
             continue;
         }
-        let device = cols[0].parse::<i32>();
+        let npu_id = cols[0].parse::<i32>();
+        let chip_id = cols[1].parse::<i32>();
         let pid = cols[2].parse::<u32>();
-        if let (Ok(device), Ok(pid)) = (device, pid) {
+        if let (Ok(npu_id), Ok(chip_id), Ok(pid)) = (npu_id, chip_id, pid) {
             if pid > 0 {
-                busy.insert(device);
+                busy_chips.insert((npu_id, chip_id));
             }
         }
     }
     if !recognized {
         bail!("无法识别 npu-smi 进程表格式");
+    }
+    let mut busy = BTreeSet::new();
+    for chip in busy_chips {
+        let Some(logic_id) = mapping.get(&chip) else {
+            bail!(
+                "npu-smi 进程表中的 NPU ID {} / Chip ID {} 不在设备映射中",
+                chip.0,
+                chip.1
+            );
+        };
+        busy.insert(*logic_id);
     }
     Ok(busy)
 }
@@ -293,9 +337,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_device_list() {
-        let text = "Total Count : 2\nNPU ID : 0\nNPU ID : 3\n";
-        assert_eq!(parse_device_list(text), vec![0, 3]);
+    fn parses_chip_logic_ids_from_device_mapping() {
+        let text = r#"
+NPU ID    Chip ID    Chip Logic ID    Chip Name
+0         0          0                Ascend 910B
+32        0          1                Ascend 910B
+32768     0          2                Ascend 910B
+32800     0          3                Ascend 910B
+32800     1          -                Mcu
+"#;
+        let mapping = parse_device_mapping(text);
+        assert_eq!(chip_logic_ids(&mapping), vec![0, 1, 2, 3]);
+        assert_eq!(mapping.get(&(32, 0)), Some(&1));
+    }
+
+    #[test]
+    fn ignores_npu_ids_outside_mapping_table() {
+        let text = "Total Count : 2\nNPU ID : 0\nNPU ID : 32\n";
+        assert!(parse_device_mapping(text).is_empty());
     }
 
     #[test]
@@ -314,20 +373,35 @@ mod tests {
         let text = r#"
 | NPU | Chip | Process id | Process name | Process memory(MB) |
 | 0   | 0    | 1234       | python3      | 100                |
-| 2   | 0    | 5678       | app          | 200                |
+| 32  | 0    | 5678       | app          | 200                |
 "#;
-        assert_eq!(parse_busy_devices(text).unwrap(), BTreeSet::from([0, 2]));
+        let mapping = BTreeMap::from([((0, 0), 0), ((32, 0), 1)]);
+        assert_eq!(
+            parse_busy_devices(text, &mapping).unwrap(),
+            BTreeSet::from([0, 1])
+        );
     }
 
     #[test]
     fn accepts_explicit_no_process_message() {
         let text = "No running processes found in NPU 0";
-        assert!(parse_busy_devices(text).unwrap().is_empty());
+        assert!(parse_busy_devices(text, &BTreeMap::new())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
     fn unknown_process_format_fails_closed() {
-        assert!(parse_busy_devices("some unexpected output").is_err());
+        assert!(parse_busy_devices("some unexpected output", &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn busy_process_with_unknown_chip_fails_closed() {
+        let text = r#"
+| NPU | Chip | Process id | Process name | Process memory(MB) |
+| 32  | 0    | 5678       | app          | 200                |
+"#;
+        assert!(parse_busy_devices(text, &BTreeMap::new()).is_err());
     }
 
     #[tokio::test]

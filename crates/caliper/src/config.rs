@@ -139,7 +139,7 @@ pub struct CannCfg {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DevicesCfg {
-    /// 空数组表示从 npu-smi / /dev/davinci* 自动发现。
+    /// 空数组表示从 npu-smi info -m 的 Chip Logic ID / /dev/davinci* 自动发现。
     #[serde(default)]
     pub ids: Vec<i32>,
     #[serde(default = "default_device_lock_dir")]
