@@ -126,11 +126,15 @@ pub async fn run_captured_stdout(
 pub fn build_atc_cmd(
     onnx: &Path,
     om_base: &Path,
+    graph_dump_dir: &Path,
     soc: &str,
     input_shape: Option<&str>,
     extra: Option<&str>,
 ) -> String {
     let mut parts: Vec<String> = vec![
+        "DUMP_GE_GRAPH=2".into(),
+        "DUMP_GRAPH_LEVEL=3".into(),
+        format!("DUMP_GRAPH_PATH={}", shq(&graph_dump_dir.to_string_lossy())),
         "atc".into(),
         // ATC 的 framework 取数值：5 = ONNX（字符串 "onnx" 在 CANN 8.5 不被接受）
         "--framework=5".into(),
@@ -209,6 +213,7 @@ mod tests {
         let cmd = build_atc_cmd(
             Path::new("/tmp/m.onnx"),
             Path::new("/tmp/m"),
+            Path::new("/tmp/atc-pbtxt"),
             "Ascend310P3",
             Some("input:1,3,224,224"),
             None,
@@ -218,6 +223,9 @@ mod tests {
         assert!(cmd.contains("--tiling_schedule_optimize=1"));
         assert!(cmd.contains("--soc_version='Ascend310P3'"));
         assert!(cmd.contains("--input_shape='input:1,3,224,224'"));
+        assert!(cmd.contains("DUMP_GE_GRAPH=2"));
+        assert!(cmd.contains("DUMP_GRAPH_LEVEL=3"));
+        assert!(cmd.contains("DUMP_GRAPH_PATH='/tmp/atc-pbtxt'"));
     }
 
     #[test]

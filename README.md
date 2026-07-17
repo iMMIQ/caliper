@@ -45,6 +45,7 @@ curl -F 'spec={"iters":100,"warmup":10};type=application/json' \
 # 轮询状态 / 取结果
 curl http://127.0.0.1:7878/v1/jobs/<job_id>
 curl -OJ http://127.0.0.1:7878/v1/jobs/<job_id>/artifacts/msprof.tar.gz
+curl -OJ http://127.0.0.1:7878/v1/jobs/<job_id>/artifacts/atc-pbtxt.tar.gz
 ```
 
 ## API
@@ -56,7 +57,7 @@ curl -OJ http://127.0.0.1:7878/v1/jobs/<job_id>/artifacts/msprof.tar.gz
 | `GET` | `/v1/jobs/{id}/events` | SSE 进度流（见下） |
 | `GET` | `/v1/jobs` | 任务列表 |
 | `GET` | `/v1/jobs/{id}/artifacts` | 产物清单 |
-| `GET` | `/v1/jobs/{id}/artifacts/{name}` | 下载产物（`model.om`/`atc.log`/`bench.json`/`msprof.tar.gz`/`result.json`） |
+| `GET` | `/v1/jobs/{id}/artifacts/{name}` | 下载产物（`model.om`/`atc.log`/`atc-pbtxt.tar.gz`/`bench.json`/`msprof.tar.gz`/`result.json`） |
 | `DELETE` | `/v1/jobs/{id}` | 取消并清理 |
 | `GET` | `/healthz` | 健康检查 |
 
@@ -104,10 +105,10 @@ require_idle = true
 
 ## 编译缓存
 
-ATC 编译按 `sha256(onnx) + soc_version + input_shape + extra_atc_flags` 缓存到 `storage/cache/<key>/`。相同输入的二次提交直接复用 OM，跳过 ATC：
+ATC 编译按 `sha256(onnx) + soc_version + input_shape + extra_atc_flags` 缓存到 `storage/cache/<key>/`。每次编译都会开启 GE 图导出，并将生成的 `.pbtxt` 打包为 `atc-pbtxt.tar.gz`。相同输入的二次提交会同时复用 OM 和 pbtxt 归档，跳过 ATC：
 
 - `JobResult.compile.cached` 标识是否命中（命中时 `duration_ms = 0`）
-- 缓存文件通过临时文件原子发布，多卡并发编译不会暴露半写入的 OM
+- 缓存文件通过临时文件原子发布，多卡并发编译不会暴露半写入的 OM 或 pbtxt 归档
 - `spec.no_cache = true` 可强制重编；删除 `storage/cache/` 即清空
 
 ## SSE 进度

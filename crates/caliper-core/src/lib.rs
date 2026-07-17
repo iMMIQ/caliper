@@ -76,6 +76,9 @@ pub struct CompileResult {
     pub duration_ms: u64,
     pub soc_version: String,
     pub om_path: String,
+    /// ATC 编译过程中的 GE 图 pbtxt 归档。
+    #[serde(default)]
+    pub atc_pbtxt_tar_gz: String,
     /// 是否命中编译缓存（命中时跳过 ATC，duration_ms 为 0）。
     #[serde(default)]
     pub cached: bool,
@@ -104,6 +107,7 @@ pub enum ArtifactKind {
     Om,
     Log,
     Bench,
+    Atc,
     Profile,
     Result,
 }

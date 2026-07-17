@@ -83,6 +83,8 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
     let onnx = store::onnx_path(&workdir);
     let om_base = store::om_base(&workdir);
     let om = store::om_path(&workdir);
+    let atc_pbtxt_dir = store::atc_pbtxt_dir(&workdir);
+    let atc_pbtxt_tgz = store::atc_pbtxt_tgz(&workdir);
 
     // ---------- 1. ATC 极限编译（带编译缓存）----------
     // 缓存键 = sha256( onnx_sha256 | soc | input_shape | extra_atc_flags )。
@@ -97,7 +99,8 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
     );
     let cache_key = hex_sha256(composite.as_bytes());
     let cache_om_path = store::cache_om(&state.storage, &cache_key);
-    let cached = !spec.no_cache && cache_om_path.exists();
+    let cache_atc_pbtxt_tgz = store::cache_atc_pbtxt_tgz(&state.storage, &cache_key);
+    let cached = !spec.no_cache && cache_om_path.exists() && cache_atc_pbtxt_tgz.exists();
 
     let compile = if cached {
         state
@@ -108,10 +111,17 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
             .await;
         std::fs::copy(&cache_om_path, &om)
             .with_context(|| format!("从缓存复制 OM 失败: {}", cache_om_path.display()))?;
+        std::fs::copy(&cache_atc_pbtxt_tgz, &atc_pbtxt_tgz).with_context(|| {
+            format!(
+                "从缓存复制 ATC pbtxt 归档失败: {}",
+                cache_atc_pbtxt_tgz.display()
+            )
+        })?;
         CompileResult {
             duration_ms: 0,
             soc_version: soc.clone(),
             om_path: om.to_string_lossy().into_owned(),
+            atc_pbtxt_tar_gz: atc_pbtxt_tgz.to_string_lossy().into_owned(),
             cached: true,
         }
     } else {
@@ -121,9 +131,14 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
                 j.stage = "atc: 极限编译中".into();
             })
             .await;
+        let _ = std::fs::remove_dir_all(&atc_pbtxt_dir);
+        let _ = std::fs::remove_file(&atc_pbtxt_tgz);
+        std::fs::create_dir_all(&atc_pbtxt_dir)
+            .with_context(|| format!("创建 ATC pbtxt 目录失败: {}", atc_pbtxt_dir.display()))?;
         let atc_cmd = tools::build_atc_cmd(
             &onnx,
             &om_base,
+            &atc_pbtxt_dir,
             &soc,
             spec.input_shape.as_deref(),
             spec.extra_atc_flags.as_deref(),
@@ -137,10 +152,13 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
             "atc",
         )
         .await?;
+        let duration_ms = t0.elapsed().as_millis() as u64;
+        tar_atc_pbtxt(&workdir, &atc_pbtxt_dir, &atc_pbtxt_tgz).await?;
         let cr = CompileResult {
-            duration_ms: t0.elapsed().as_millis() as u64,
+            duration_ms,
             soc_version: soc.clone(),
             om_path: om.to_string_lossy().into_owned(),
+            atc_pbtxt_tar_gz: atc_pbtxt_tgz.to_string_lossy().into_owned(),
             cached: false,
         };
         // 先写任务专属临时文件再 rename，避免多卡并发任务观察到半写入的缓存。
@@ -148,9 +166,13 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
             let _ = std::fs::create_dir_all(store::cache_dir(&state.storage, &cache_key));
             let cache_tmp =
                 store::cache_dir(&state.storage, &cache_key).join(format!("model.{id}.tmp"));
-            if std::fs::copy(&om, &cache_tmp).is_ok()
-                && std::fs::rename(&cache_tmp, &cache_om_path).is_ok()
-            {
+            let pbtxt_cache_tmp =
+                store::cache_dir(&state.storage, &cache_key).join(format!("atc-pbtxt.{id}.tmp"));
+            let om_cached = std::fs::copy(&om, &cache_tmp).is_ok()
+                && std::fs::rename(&cache_tmp, &cache_om_path).is_ok();
+            let pbtxt_cached = std::fs::copy(&atc_pbtxt_tgz, &pbtxt_cache_tmp).is_ok()
+                && std::fs::rename(&pbtxt_cache_tmp, &cache_atc_pbtxt_tgz).is_ok();
+            if om_cached && pbtxt_cached {
                 let manifest = json!({
                     "key": &cache_key,
                     "source_sha256": &onnx_sha,
@@ -158,6 +180,7 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
                     "input_shape": spec.input_shape,
                     "extra_atc_flags": spec.extra_atc_flags,
                     "om_size": std::fs::metadata(&om).map(|m| m.len()).unwrap_or(0),
+                    "atc_pbtxt_tar_gz_size": std::fs::metadata(&atc_pbtxt_tgz).map(|m| m.len()).unwrap_or(0),
                 });
                 let manifest_path = store::cache_manifest(&state.storage, &cache_key);
                 let manifest_tmp = manifest_path.with_extension(format!("{id}.tmp"));
@@ -171,6 +194,7 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
                 }
             } else {
                 let _ = std::fs::remove_file(cache_tmp);
+                let _ = std::fs::remove_file(pbtxt_cache_tmp);
             }
         }
         cr
@@ -236,7 +260,7 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
     )
     .await?;
     let tgz = store::msprof_tgz(&workdir);
-    tar_msprof(&workdir, &tgz).await?;
+    tar_directory(&workdir, &tgz, "msprof", "msprof").await?;
     let profile = ProfileResult {
         duration_ms: t1.elapsed().as_millis() as u64,
         msprof_dir: msprof_out.to_string_lossy().into_owned(),
@@ -308,19 +332,59 @@ async fn mark_cancelled(state: &Arc<AppState>, id: &str) {
         .await;
 }
 
-async fn tar_msprof(workdir: &Path, tgz: &Path) -> Result<()> {
+async fn tar_atc_pbtxt(workdir: &Path, source_dir: &Path, tgz: &Path) -> Result<()> {
+    let mut files = Vec::new();
+    collect_pbtxt(source_dir, &mut files)?;
+    if files.is_empty() {
+        anyhow::bail!("ATC 未在 {} 生成 .pbtxt 图文件", source_dir.display());
+    }
+    let mut command = Command::new("tar");
+    command.arg("-czf").arg(tgz).arg("-C").arg(workdir);
+    for path in files {
+        command.arg(
+            path.strip_prefix(workdir)
+                .with_context(|| format!("ATC pbtxt 不在任务目录内: {}", path.display()))?,
+        );
+    }
+    let status = command
+        .stderr(Stdio::piped())
+        .status()
+        .await
+        .context("执行 tar 打包 ATC pbtxt 失败")?;
+    if !status.success() {
+        anyhow::bail!("tar ATC pbtxt 失败 exit={:?}", status.code());
+    }
+    Ok(())
+}
+
+fn collect_pbtxt(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("读取 ATC pbtxt 目录失败: {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_pbtxt(&path, files)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("pbtxt") {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+async fn tar_directory(workdir: &Path, tgz: &Path, entry: &str, label: &str) -> Result<()> {
     let status = Command::new("tar")
         .arg("-czf")
         .arg(tgz)
         .arg("-C")
         .arg(workdir)
-        .arg("msprof")
+        .arg(entry)
         .stderr(Stdio::piped())
         .status()
         .await
-        .context("执行 tar 打包 msprof 失败")?;
+        .with_context(|| format!("执行 tar 打包 {label} 失败"))?;
     if !status.success() {
-        anyhow::bail!("tar msprof 失败 exit={:?}", status.code());
+        anyhow::bail!("tar {label} 失败 exit={:?}", status.code());
     }
     Ok(())
 }
@@ -334,4 +398,61 @@ fn hex_sha256(bytes: &[u8]) -> String {
 fn sha256_file(path: &Path) -> Result<String> {
     let data = std::fs::read(path).with_context(|| format!("读取文件失败: {}", path.display()))?;
     Ok(hex_sha256(&data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collects_pbtxt_recursively() {
+        let dir = test_dir("pbtxt");
+        let nested = dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.join("graph.txt"), b"not a pbtxt").unwrap();
+        let mut files = Vec::new();
+        collect_pbtxt(&dir, &mut files).unwrap();
+        assert!(files.is_empty());
+
+        let pbtxt = nested.join("ge_onnx_00000.pbtxt");
+        std::fs::write(&pbtxt, b"graph").unwrap();
+        collect_pbtxt(&dir, &mut files).unwrap();
+        assert_eq!(files, vec![pbtxt]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn archives_atc_pbtxt_directory() {
+        let workdir = test_dir("pbtxt-tar");
+        let source = store::atc_pbtxt_dir(&workdir);
+        let archive = store::atc_pbtxt_tgz(&workdir);
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("ge_onnx_00000.pbtxt"), b"graph").unwrap();
+        std::fs::write(source.join("ge_proto_00000.txt"), b"other graph").unwrap();
+
+        tar_atc_pbtxt(&workdir, &source, &archive).await.unwrap();
+        let listing = std::process::Command::new("tar")
+            .arg("-tzf")
+            .arg(&archive)
+            .output()
+            .unwrap();
+        assert!(listing.status.success());
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert!(listing.contains("atc-pbtxt/ge_onnx_00000.pbtxt"));
+        assert!(!listing.contains("ge_proto_00000.txt"));
+
+        let _ = std::fs::remove_dir_all(workdir);
+    }
+
+    fn test_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "caliper-pipeline-test-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
 }
