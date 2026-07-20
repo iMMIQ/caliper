@@ -208,7 +208,7 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
     state
         .update_job(id, |j| {
             j.status = JobStatus::Benchmarking;
-            j.stage = "caliper-runner: 基准中".into();
+            j.stage = "caliper-runner: 模型与 H2D/D2H 基准中".into();
         })
         .await;
     let runner_cmd = tools::build_runner_cmd(
@@ -229,6 +229,9 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
     .await?;
     let bench: BenchmarkResult =
         serde_json::from_str(stdout.trim()).context("解析 caliper-runner 输出失败")?;
+    if bench.transfer.is_none() {
+        anyhow::bail!("caliper-runner 未返回模型 H2D/D2H 测量结果");
+    }
     let _ = std::fs::write(
         store::bench_json(&workdir),
         serde_json::to_vec_pretty(&bench)?,

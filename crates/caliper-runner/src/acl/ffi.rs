@@ -15,6 +15,10 @@ pub type Error = i32;
 pub const OK: Error = 0;
 /// aclrtMemMallocPolicy::ACL_MEM_MALLOC_HUGE_FIRST
 pub const MEM_HUGE_FIRST: i32 = 0;
+/// aclrtMemcpyKind::ACL_MEMCPY_HOST_TO_DEVICE
+pub const MEMCPY_HOST_TO_DEVICE: i32 = 1;
+/// aclrtMemcpyKind::ACL_MEMCPY_DEVICE_TO_HOST
+pub const MEMCPY_DEVICE_TO_HOST: i32 = 2;
 
 pub type Handle = *mut c_void;
 
@@ -63,6 +67,9 @@ pub type FnCreateDataBuffer = unsafe extern "C" fn(*mut c_void, usize) -> Handle
 pub type FnDestroyDataBuffer = unsafe extern "C" fn(Handle) -> Error;
 pub type FnMalloc = unsafe extern "C" fn(*mut *mut c_void, usize, i32) -> Error;
 pub type FnFree = unsafe extern "C" fn(*mut c_void) -> Error;
+pub type FnMallocHost = unsafe extern "C" fn(*mut *mut c_void, usize) -> Error;
+pub type FnFreeHost = unsafe extern "C" fn(*mut c_void) -> Error;
+pub type FnMemcpy = unsafe extern "C" fn(*mut c_void, usize, *const c_void, usize, i32) -> Error;
 pub type FnMemset = unsafe extern "C" fn(*mut c_void, usize, i32, usize) -> Error;
 pub type FnExecute = unsafe extern "C" fn(u32, Handle, Handle) -> Error;
 
@@ -91,6 +98,9 @@ pub struct Ffi {
     pub destroy_data_buffer: FnDestroyDataBuffer,
     pub rt_malloc: FnMalloc,
     pub rt_free: FnFree,
+    pub rt_malloc_host: FnMallocHost,
+    pub rt_free_host: FnFreeHost,
+    pub rt_memcpy: FnMemcpy,
     pub rt_memset: FnMemset,
     pub mdl_execute: FnExecute,
 }
@@ -127,6 +137,9 @@ impl Ffi {
                 destroy_data_buffer: *lib.get::<FnDestroyDataBuffer>(b"aclDestroyDataBuffer\0")?,
                 rt_malloc: *lib.get::<FnMalloc>(b"aclrtMalloc\0")?,
                 rt_free: *lib.get::<FnFree>(b"aclrtFree\0")?,
+                rt_malloc_host: *lib.get::<FnMallocHost>(b"aclrtMallocHost\0")?,
+                rt_free_host: *lib.get::<FnFreeHost>(b"aclrtFreeHost\0")?,
+                rt_memcpy: *lib.get::<FnMemcpy>(b"aclrtMemcpy\0")?,
                 rt_memset: *lib.get::<FnMemset>(b"aclrtMemset\0")?,
                 mdl_execute: *lib.get::<FnExecute>(b"aclmdlExecute\0")?,
                 _lib: lib,

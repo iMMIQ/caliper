@@ -68,6 +68,21 @@ pub struct BenchmarkResult {
     pub latency_us: LatencyStats,
     pub inputs: Vec<IoDesc>,
     pub outputs: Vec<IoDesc>,
+    /// 一次模型请求全部输入/输出 tensor 的同步传输时延。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer: Option<ModelTransferResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelTransferResult {
+    pub iterations: u32,
+    pub warmup: u32,
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    pub h2d_latency_us: LatencyStats,
+    pub d2h_latency_us: LatencyStats,
+    pub h2d_effective_bandwidth_gbps: f64,
+    pub d2h_effective_bandwidth_gbps: f64,
 }
 
 /// ATC 编译结果。
@@ -263,5 +278,19 @@ mod tests {
         let s: JobSpec = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(s.iters, 100);
         assert_eq!(s.warmup, 10);
+    }
+
+    #[test]
+    fn old_benchmark_without_transfer_remains_readable() {
+        let json = r#"{
+            "iterations": 1,
+            "warmup": 0,
+            "device": 0,
+            "latency_us": {"mean":1.0,"p50":1.0,"p99":1.0,"min":1.0,"max":1.0,"stddev":0.0},
+            "inputs": [],
+            "outputs": []
+        }"#;
+        let benchmark: BenchmarkResult = serde_json::from_str(json).unwrap();
+        assert!(benchmark.transfer.is_none());
     }
 }

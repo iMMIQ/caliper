@@ -6,9 +6,12 @@ pub mod ffi;
 use anyhow::{bail, Result};
 use std::ffi::CString;
 use std::path::Path;
+use std::time::Instant;
 
 use caliper_core::IoDesc;
-use ffi::{Error, Ffi, Handle, IODims, MEM_HUGE_FIRST, OK};
+use ffi::{
+    Error, Ffi, Handle, IODims, MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEVICE, MEM_HUGE_FIRST, OK,
+};
 
 /// 已加载模型的资源句柄，用于卸载时按序释放。
 struct ModelHandles {
@@ -17,7 +20,13 @@ struct ModelHandles {
     input_ds: Handle,
     output_ds: Handle,
     data_bufs: Vec<Handle>,
-    dev_ptrs: Vec<*mut std::ffi::c_void>,
+    input_buffers: Vec<MemoryBuffer>,
+    output_buffers: Vec<MemoryBuffer>,
+}
+
+struct MemoryBuffer {
+    ptr: *mut std::ffi::c_void,
+    size: usize,
 }
 
 pub struct Acl {
@@ -84,14 +93,28 @@ impl Acl {
         let n_out = unsafe { (self.f.mdl_get_num_outputs)(desc) };
 
         let mut data_bufs = Vec::new();
-        let mut dev_ptrs = Vec::new();
+        let mut input_buffers = Vec::new();
+        let mut output_buffers = Vec::new();
 
         let input_ds = unsafe { (self.f.mdl_create_dataset)() };
-        let inputs = self.build_side(desc, n_in, true, input_ds, &mut data_bufs, &mut dev_ptrs)?;
+        let inputs = self.build_side(
+            desc,
+            n_in,
+            true,
+            input_ds,
+            &mut data_bufs,
+            &mut input_buffers,
+        )?;
 
         let output_ds = unsafe { (self.f.mdl_create_dataset)() };
-        let outputs =
-            self.build_side(desc, n_out, false, output_ds, &mut data_bufs, &mut dev_ptrs)?;
+        let outputs = self.build_side(
+            desc,
+            n_out,
+            false,
+            output_ds,
+            &mut data_bufs,
+            &mut output_buffers,
+        )?;
 
         self.model = Some(ModelHandles {
             id: model_id,
@@ -99,7 +122,8 @@ impl Acl {
             input_ds,
             output_ds,
             data_bufs,
-            dev_ptrs,
+            input_buffers,
+            output_buffers,
         });
         Ok((inputs, outputs))
     }
@@ -112,7 +136,7 @@ impl Acl {
         is_input: bool,
         dataset: Handle,
         data_bufs: &mut Vec<Handle>,
-        dev_ptrs: &mut Vec<*mut std::ffi::c_void>,
+        device_buffers: &mut Vec<MemoryBuffer>,
     ) -> Result<Vec<IoDesc>> {
         let mut out = Vec::with_capacity(count);
         for i in 0..count {
@@ -142,7 +166,7 @@ impl Acl {
                 (self.f.mdl_add_dataset_buffer)(dataset, buf)
             })?;
             data_bufs.push(buf);
-            dev_ptrs.push(dev);
+            device_buffers.push(MemoryBuffer { ptr: dev, size });
 
             let shape = self.query_dims(desc, i, is_input).unwrap_or_default();
             out.push(IoDesc {
@@ -176,6 +200,210 @@ impl Acl {
         })
     }
 
+    /// 采集一次模型请求全部输入 tensor 的 H2D，以及全部输出 tensor 的 D2H 时延。
+    /// 每个 tensor 使用独立页锁定 host buffer，分配和释放不计入样本。
+    pub fn measure_model_transfer_ns(
+        &self,
+        iterations: u32,
+        warmup: u32,
+    ) -> Result<(Vec<f64>, Vec<f64>)> {
+        if iterations == 0 {
+            bail!("iterations 必须大于 0");
+        }
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("measure_model_transfer_ns 前未加载模型"))?;
+        if model.input_buffers.is_empty() || model.output_buffers.is_empty() {
+            bail!("模型必须至少包含一个输入和一个输出");
+        }
+
+        let host_inputs = self.allocate_host_buffers(&model.input_buffers)?;
+        let host_outputs = match self.allocate_host_buffers(&model.output_buffers) {
+            Ok(buffers) => buffers,
+            Err(error) => {
+                let _ = self.free_host_buffers(&host_inputs);
+                return Err(error);
+            }
+        };
+
+        let measured = (|| -> Result<(Vec<f64>, Vec<f64>)> {
+            let h2d = || {
+                for (host, device) in host_inputs.iter().zip(&model.input_buffers) {
+                    check("aclrtMemcpy(model H2D)", unsafe {
+                        (self.f.rt_memcpy)(
+                            device.ptr,
+                            device.size,
+                            host.ptr,
+                            host.size,
+                            MEMCPY_HOST_TO_DEVICE,
+                        )
+                    })?;
+                }
+                Ok::<(), anyhow::Error>(())
+            };
+            let d2h = || {
+                for (host, device) in host_outputs.iter().zip(&model.output_buffers) {
+                    check("aclrtMemcpy(model D2H)", unsafe {
+                        (self.f.rt_memcpy)(
+                            host.ptr,
+                            host.size,
+                            device.ptr,
+                            device.size,
+                            MEMCPY_DEVICE_TO_HOST,
+                        )
+                    })?;
+                }
+                Ok::<(), anyhow::Error>(())
+            };
+
+            for _ in 0..warmup {
+                h2d()?;
+            }
+            let mut h2d_ns = Vec::with_capacity(iterations as usize);
+            for _ in 0..iterations {
+                let t0 = Instant::now();
+                h2d()?;
+                h2d_ns.push(t0.elapsed().as_nanos() as f64);
+            }
+
+            for _ in 0..warmup {
+                d2h()?;
+            }
+            let mut d2h_ns = Vec::with_capacity(iterations as usize);
+            for _ in 0..iterations {
+                let t0 = Instant::now();
+                d2h()?;
+                d2h_ns.push(t0.elapsed().as_nanos() as f64);
+            }
+            Ok((h2d_ns, d2h_ns))
+        })();
+
+        let free_inputs = self.free_host_buffers(&host_inputs);
+        let free_outputs = self.free_host_buffers(&host_outputs);
+        match measured {
+            Err(error) => Err(error),
+            Ok(samples) => {
+                free_inputs?;
+                free_outputs?;
+                Ok(samples)
+            }
+        }
+    }
+
+    fn allocate_host_buffers(&self, device_buffers: &[MemoryBuffer]) -> Result<Vec<MemoryBuffer>> {
+        let mut host_buffers = Vec::with_capacity(device_buffers.len());
+        for device in device_buffers {
+            let mut host = std::ptr::null_mut();
+            if let Err(error) = check("aclrtMallocHost", unsafe {
+                (self.f.rt_malloc_host)(&mut host, device.size)
+            }) {
+                let _ = self.free_host_buffers(&host_buffers);
+                return Err(error);
+            }
+            unsafe { std::ptr::write_bytes(host.cast::<u8>(), 0xA5, device.size) };
+            host_buffers.push(MemoryBuffer {
+                ptr: host,
+                size: device.size,
+            });
+        }
+        Ok(host_buffers)
+    }
+
+    fn free_host_buffers(&self, buffers: &[MemoryBuffer]) -> Result<()> {
+        let mut result = Ok(());
+        for buffer in buffers {
+            if let Err(error) = check("aclrtFreeHost", unsafe {
+                (self.f.rt_free_host)(buffer.ptr)
+            }) {
+                if result.is_ok() {
+                    result = Err(error);
+                }
+            }
+        }
+        result
+    }
+
+    /// 使用预先分配的页锁定 host 内存和 device 内存，采集同步 H2D/D2H 拷贝时延。
+    /// 分配、初始化和释放均不计入样本。
+    pub fn measure_transfer_ns(
+        &self,
+        size: usize,
+        iterations: u32,
+        warmup: u32,
+    ) -> Result<(Vec<f64>, Vec<f64>)> {
+        if self.device.is_none() {
+            bail!("measure_transfer_ns 前未 set device");
+        }
+        if size == 0 {
+            bail!("传输大小必须大于 0");
+        }
+        if iterations == 0 {
+            bail!("iterations 必须大于 0");
+        }
+
+        let mut host = std::ptr::null_mut();
+        check("aclrtMallocHost", unsafe {
+            (self.f.rt_malloc_host)(&mut host, size)
+        })?;
+
+        let mut device = std::ptr::null_mut();
+        if let Err(error) = check("aclrtMalloc", unsafe {
+            (self.f.rt_malloc)(&mut device, size, MEM_HUGE_FIRST)
+        }) {
+            let _ = check("aclrtFreeHost", unsafe { (self.f.rt_free_host)(host) });
+            return Err(error);
+        }
+
+        // 提前触碰全部 host 页，避免缺页开销落入首次拷贝。
+        unsafe { std::ptr::write_bytes(host.cast::<u8>(), 0xA5, size) };
+
+        let measured = (|| -> Result<(Vec<f64>, Vec<f64>)> {
+            let h2d = || {
+                check("aclrtMemcpy(H2D)", unsafe {
+                    (self.f.rt_memcpy)(device, size, host, size, MEMCPY_HOST_TO_DEVICE)
+                })
+            };
+            let d2h = || {
+                check("aclrtMemcpy(D2H)", unsafe {
+                    (self.f.rt_memcpy)(host, size, device, size, MEMCPY_DEVICE_TO_HOST)
+                })
+            };
+
+            for _ in 0..warmup {
+                h2d()?;
+            }
+            let mut h2d_ns = Vec::with_capacity(iterations as usize);
+            for _ in 0..iterations {
+                let t0 = Instant::now();
+                h2d()?;
+                h2d_ns.push(t0.elapsed().as_nanos() as f64);
+            }
+
+            for _ in 0..warmup {
+                d2h()?;
+            }
+            let mut d2h_ns = Vec::with_capacity(iterations as usize);
+            for _ in 0..iterations {
+                let t0 = Instant::now();
+                d2h()?;
+                d2h_ns.push(t0.elapsed().as_nanos() as f64);
+            }
+            Ok((h2d_ns, d2h_ns))
+        })();
+
+        let free_device = check("aclrtFree", unsafe { (self.f.rt_free)(device) });
+        let free_host = check("aclrtFreeHost", unsafe { (self.f.rt_free_host)(host) });
+        match measured {
+            Err(error) => Err(error),
+            Ok(samples) => {
+                free_device?;
+                free_host?;
+                Ok(samples)
+            }
+        }
+    }
+
     /// 卸载模型并释放资源（best-effort，忽略个别错误以尽量清理）。
     pub fn unload_model(&mut self) {
         if let Some(m) = self.model.take() {
@@ -184,9 +412,9 @@ impl Acl {
                     (self.f.destroy_data_buffer)(b)
                 });
             }
-            for p in m.dev_ptrs {
-                if !p.is_null() {
-                    let _ = check("aclrtFree", unsafe { (self.f.rt_free)(p) });
+            for buffer in m.input_buffers.into_iter().chain(m.output_buffers) {
+                if !buffer.ptr.is_null() {
+                    let _ = check("aclrtFree", unsafe { (self.f.rt_free)(buffer.ptr) });
                 }
             }
             let _ = check("aclmdlDestroyDataset", unsafe {

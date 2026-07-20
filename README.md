@@ -13,7 +13,7 @@
 ```
 
 - **编译**：`atc --framework=onnx ... --oo_level=O3 --buffer_optimize=l2_optimize --tiling_schedule_optimize=1`（极限优化预设）
-- **基准**：自研 `caliper-runner`，FFI 动态加载 `libascendcl`，warmup 后同步执行 N 次，统计 mean/p50/p99/min/max/std（μs）
+- **基准**：自研 `caliper-runner`，FFI 动态加载 `libascendcl`，warmup 后分别测量模型执行、全部输入 H2D 和全部输出 D2H，统计 mean/p50/p99/min/max/std（μs）
 - **取证**：`msprof --application="caliper-runner ..."` 复用同一 runner 采集 profiling 原始数据
 
 ## 工作区
@@ -28,8 +28,29 @@
 
 ```bash
 cargo build --release
-# 产物：target/release/caliper 与 target/release/caliper-runner
+# 产物：target/release/caliper、caliper-runner 与 caliper-transfer
 ```
+
+## H2D / D2H 传输时延实验
+
+`caliper-transfer` 单独测量 host 与 device 之间的同步传输，不需要 ONNX/OM。实验在计时前通过
+`aclrtMallocHost` 和 `aclrtMalloc` 分配缓冲区并触碰 host 内存页；预热后，每个样本只包围一次
+`aclrtMemcpy`。因此结果表示应用侧可见的单次同步拷贝时延，不包含内存分配、初始化和释放时间。
+原有 `caliper-runner` 直接分配并初始化 device buffer，每次迭代只执行 `aclmdlExecute`，其模型
+时延统计不包含 H2D/D2H。
+
+```bash
+cargo build --release -p caliper-runner --bin caliper-transfer
+
+./target/release/caliper-transfer \
+  --lib /usr/local/Ascend/ascend-toolkit/latest/lib64/libascendcl.so \
+  --device 0 --iters 100 --warmup 10 \
+  --sizes 4K,64K,1M,16M,64M
+```
+
+程序向 stdout 输出 JSON。每种大小分别包含 H2D/D2H 的 mean、p50、p99、min、max、stddev
+（单位均为 us），以及按平均时延计算的有效带宽（十进制 GB/s）。小消息主要反映固定调用与传输
+开销，大消息更适合观察链路吞吐。
 
 ## 运行
 
@@ -60,6 +81,36 @@ curl -OJ http://127.0.0.1:7878/v1/jobs/<job_id>/artifacts/atc-pbtxt.tar.gz
 | `GET` | `/v1/jobs/{id}/artifacts/{name}` | 下载产物（`model.om`/`atc.log`/`atc-pbtxt.tar.gz`/`bench.json`/`msprof.tar.gz`/`result.json`） |
 | `DELETE` | `/v1/jobs/{id}` | 取消并清理 |
 | `GET` | `/healthz` | 健康检查 |
+
+任务完成后，`GET /v1/jobs/{id}` 的 `result.benchmark.transfer` 返回这个模型一次请求的传输结果：
+
+```json
+{
+  "input_bytes": 602112,
+  "output_bytes": 4000,
+  "h2d_latency_us": {
+    "mean": 62.1,
+    "p50": 61.8,
+    "p99": 68.4,
+    "min": 60.9,
+    "max": 70.2,
+    "stddev": 1.6
+  },
+  "d2h_latency_us": {
+    "mean": 11.7,
+    "p50": 11.5,
+    "p99": 15.9,
+    "min": 11.2,
+    "max": 17.1,
+    "stddev": 0.8
+  },
+  "h2d_effective_bandwidth_gbps": 9.69,
+  "d2h_effective_bandwidth_gbps": 0.34
+}
+```
+
+H2D 的单个样本覆盖该模型所有输入 tensor 的顺序拷贝，D2H 同理覆盖所有输出 tensor；buffer
+分配和初始化不计时。`iterations` 和 `warmup` 与任务的同名字段一致。
 
 ## JobSpec 字段
 

@@ -167,7 +167,7 @@ pub fn build_runner_cmd(
     lib: &Path,
 ) -> String {
     format!(
-        "{} --om {} --device {} --iters {} --warmup {} --lib {}",
+        "{} --om {} --device {} --iters {} --warmup {} --lib {} --measure-transfer",
         shq(&runner.to_string_lossy()),
         shq(&om.to_string_lossy()),
         device,
@@ -231,5 +231,17 @@ mod tests {
     #[test]
     fn shq_quotes_spaces() {
         assert_eq!(shq("a b"), "'a b'");
+    }
+
+    #[test]
+    fn runner_measures_transfer_but_msprof_does_not() {
+        let runner = Path::new("/tmp/caliper-runner");
+        let om = Path::new("/tmp/model.om");
+        let lib = Path::new("/tmp/libascendcl.so");
+        let cmd = build_runner_cmd(runner, om, 0, 100, 10, lib);
+        assert!(cmd.contains("--measure-transfer"));
+
+        let msprof = build_msprof_cmd(runner, om, 0, 10, lib, Path::new("/tmp/msprof"));
+        assert!(!msprof.contains("--measure-transfer"));
     }
 }
