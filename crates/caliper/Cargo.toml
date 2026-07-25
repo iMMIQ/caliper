@@ -23,3 +23,6 @@ thiserror.workspace = true
 clap.workspace = true
 chrono.workspace = true
 caliper-core.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

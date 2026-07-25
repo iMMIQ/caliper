@@ -3,6 +3,7 @@
 
 [server]
 bind = "0.0.0.0:7878"
+max_upload_mib = 10240 # 整个 multipart 请求上限，默认 10 GiB
 
 [storage]
 dir = "storage"

@@ -15,6 +15,9 @@ pub struct Cli {
     /// 监听地址，如 0.0.0.0:7878
     #[arg(long)]
     pub bind: Option<String>,
+    /// multipart 上传请求上限（MiB）
+    #[arg(long = "max-upload-mib")]
+    pub max_upload_mib: Option<usize>,
     /// 任务存储目录
     #[arg(long)]
     pub storage: Option<PathBuf>,
@@ -65,16 +68,22 @@ pub struct ConfigFile {
 pub struct ServerCfg {
     #[serde(default = "default_bind")]
     pub bind: String,
+    #[serde(default = "default_max_upload_mib")]
+    pub max_upload_mib: usize,
 }
 impl Default for ServerCfg {
     fn default() -> Self {
         Self {
             bind: default_bind(),
+            max_upload_mib: default_max_upload_mib(),
         }
     }
 }
 fn default_bind() -> String {
     "0.0.0.0:7878".into()
+}
+fn default_max_upload_mib() -> usize {
+    10 * 1024
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -177,6 +186,7 @@ fn default_true() -> bool {
 #[allow(dead_code)] // iters/warmup/msprof_iters 当前由 JobSpec 驱动，留作服务端默认值的预留开关
 pub struct Config {
     pub bind: String,
+    pub max_upload_bytes: usize,
     pub storage: PathBuf,
     pub device_ids: Vec<i32>,
     pub device_lock_dir: PathBuf,
@@ -207,12 +217,19 @@ impl Config {
             ConfigFile::default()
         };
 
+        let max_upload_mib = cli.max_upload_mib.unwrap_or(file.server.max_upload_mib);
+        anyhow::ensure!(max_upload_mib > 0, "max_upload_mib 必须大于 0");
+        let max_upload_bytes = max_upload_mib
+            .checked_mul(1024 * 1024)
+            .context("max_upload_mib 数值过大")?;
+
         Ok(Self {
             bind: cli
                 .bind
                 .clone()
                 .or(Some(file.server.bind))
                 .unwrap_or_else(default_bind),
+            max_upload_bytes,
             storage: cli
                 .storage
                 .clone()
@@ -243,5 +260,39 @@ impl Config {
                 .or_else(|| file.cann.libascendcl.as_ref().map(PathBuf::from)),
             config_path,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_ten_gib_upload_limit() {
+        assert_eq!(
+            ServerCfg::default().max_upload_mib,
+            10 * 1024,
+            "默认配置应允许 10 GiB multipart 请求"
+        );
+    }
+
+    #[test]
+    fn cli_overrides_upload_limit() {
+        let missing_config = format!(
+            "/tmp/caliper-missing-config-{}-{}.toml",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        );
+        let cli = Cli::try_parse_from([
+            "caliper",
+            "--config",
+            missing_config.as_str(),
+            "--max-upload-mib",
+            "123",
+        ])
+        .unwrap();
+
+        let config = Config::resolve(&cli).unwrap();
+        assert_eq!(config.max_upload_bytes, 123 * 1024 * 1024);
     }
 }

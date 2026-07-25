@@ -58,6 +58,9 @@ cargo build --release -p caliper-runner --bin caliper-transfer
 # 启动服务（CANN 自动发现，soc 版本从 npu-smi 推断）
 ./target/release/caliper
 
+# 如需调整整个 multipart 请求的上传上限（单位 MiB）
+./target/release/caliper --max-upload-mib 20480
+
 # 上传 ONNX
 curl -F 'spec={"iters":100,"warmup":10};type=application/json' \
      -F 'onnx=@model.onnx' \
@@ -68,6 +71,10 @@ curl http://127.0.0.1:7878/v1/jobs/<job_id>
 curl -OJ http://127.0.0.1:7878/v1/jobs/<job_id>/artifacts/msprof.tar.gz
 curl -OJ http://127.0.0.1:7878/v1/jobs/<job_id>/artifacts/atc-pbtxt.tar.gz
 ```
+
+上传请求默认上限为 10240 MiB（10 GiB），也可通过配置文件中的
+`server.max_upload_mib` 或命令行参数 `--max-upload-mib` 调整。ONNX 内容按分块写入磁盘，不会将
+整个模型保存在内存中；任务进入队列前，存储目录必须有足够空间容纳完整模型。
 
 ## API
 

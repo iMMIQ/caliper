@@ -28,6 +28,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::resolve(&cli)?;
     let bind = cfg.bind.clone();
+    info!(
+        max_upload_mib = cfg.max_upload_bytes / (1024 * 1024),
+        "上传限制"
+    );
 
     let cann = cann::discover(cfg.cann_home.as_deref())?;
     info!(home = %cann.home.display(), "CANN 已发现");

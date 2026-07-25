@@ -3,7 +3,10 @@
 use crate::state::AppState;
 use crate::store;
 use axum::{
-    extract::{Multipart, Path, State},
+    extract::{
+        multipart::{Field, MultipartError},
+        DefaultBodyLimit, Multipart, Path, State,
+    },
     http::{header, StatusCode},
     response::{sse::Event, sse::KeepAlive, sse::Sse, IntoResponse, Response},
     routing::{get, post},
@@ -13,14 +16,23 @@ use caliper_core::{Artifact, Job, JobStatus};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+
+const MAX_SPEC_BYTES: usize = 64 * 1024;
 
 pub fn router(state: Arc<AppState>) -> Router {
+    let max_upload_bytes = state.cfg.max_upload_bytes;
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/v1/jobs", post(create_job).get(list_jobs))
+        .route(
+            "/v1/jobs",
+            post(create_job)
+                .get(list_jobs)
+                .layer(DefaultBodyLimit::max(max_upload_bytes)),
+        )
         .route("/v1/jobs/:id", get(get_job).delete(cancel_job))
         .route("/v1/jobs/:id/events", get(job_events))
         .route("/v1/jobs/:id/artifacts", get(list_artifacts))
@@ -34,59 +46,126 @@ async fn healthz() -> &'static str {
 
 type ApiError = (StatusCode, String);
 
+struct PendingUpload {
+    workdir: PathBuf,
+    keep: bool,
+}
+
+impl PendingUpload {
+    fn new(workdir: PathBuf) -> Self {
+        Self {
+            workdir,
+            keep: false,
+        }
+    }
+
+    fn keep(mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for PendingUpload {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_dir_all(&self.workdir);
+        }
+    }
+}
+
+fn multipart_error(context: &str, error: MultipartError) -> ApiError {
+    (error.status(), format!("{context}: {}", error.body_text()))
+}
+
+async fn read_spec(mut field: Field<'_>) -> Result<String, ApiError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| multipart_error("read spec", e))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MAX_SPEC_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("spec 字段不能超过 {} KiB", MAX_SPEC_BYTES / 1024),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("spec 不是有效 UTF-8: {e}")))
+}
+
+async fn write_onnx(mut field: Field<'_>, path: &FsPath) -> Result<String, ApiError> {
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut hasher = Sha256::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| multipart_error("read onnx", e))?
+    {
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        hasher.update(&chunk);
+    }
+    file.flush()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    drop(file);
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect())
+}
+
 async fn create_job(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, ApiError> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let workdir = store::job_dir(&state.storage, &id);
+    std::fs::create_dir_all(&workdir)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let pending = PendingUpload::new(workdir.clone());
+
     let mut spec: Option<caliper_core::JobSpec> = None;
-    let mut onnx: Option<Vec<u8>> = None;
+    let mut onnx_sha: Option<String> = None;
     let mut onnx_name: Option<String> = None;
 
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("multipart: {e}")))?
+        .map_err(|e| multipart_error("multipart", e))?
     {
         match field.name().unwrap_or("") {
             "spec" => {
-                let txt = field
-                    .text()
-                    .await
-                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("read spec: {e}")))?;
+                let txt = read_spec(field).await?;
                 spec = Some(
                     serde_json::from_str(&txt)
                         .map_err(|e| (StatusCode::BAD_REQUEST, format!("parse spec: {e}")))?,
                 );
             }
             "onnx" => {
+                if onnx_sha.is_some() {
+                    return Err((StatusCode::BAD_REQUEST, "onnx 字段不能重复".into()));
+                }
                 onnx_name = field.file_name().map(|s| s.to_string());
-                let bytes = field
-                    .bytes()
+                let upload_path = workdir.join("model.onnx.uploading");
+                let hash = write_onnx(field, &upload_path).await?;
+                tokio::fs::rename(&upload_path, store::onnx_path(&workdir))
                     .await
-                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("read onnx: {e}")))?;
-                onnx = Some(bytes.to_vec());
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                onnx_sha = Some(hash);
             }
             _ => { /* ignore unknown */ }
         }
     }
 
-    let onnx = onnx.ok_or((StatusCode::BAD_REQUEST, "缺少 onnx 字段".into()))?;
+    let hash = onnx_sha.ok_or((StatusCode::BAD_REQUEST, "缺少 onnx 字段".into()))?;
     let spec = spec.unwrap_or_default();
-
-    let id = uuid::Uuid::new_v4().to_string();
-    let workdir = store::job_dir(&state.storage, &id);
-    std::fs::create_dir_all(&workdir)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    std::fs::write(store::onnx_path(&workdir), &onnx)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let mut hasher = Sha256::new();
-    hasher.update(&onnx);
-    let hash: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect();
     let meta = json!({"id": &id, "spec": &spec, "onnx_name": &onnx_name, "sha256": &hash});
     let _ = std::fs::write(
         store::meta_json(&workdir),
@@ -109,6 +188,7 @@ async fn create_job(
     };
     state.insert_job(job).await;
     state.register_cancel(&id).await;
+    pending.keep();
 
     let st = state.clone();
     let id_run = id.clone();
@@ -264,4 +344,73 @@ async fn job_events(
             .interval(Duration::from_secs(15))
             .text("keepalive"),
     )
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn accepts_and_streams_multipart_larger_than_axum_default() {
+        const BOUNDARY: &str = "caliper-large-upload-test";
+        const MODEL_SIZE: usize = 3 * 1024 * 1024;
+
+        let dir = std::env::temp_dir().join(format!(
+            "caliper-upload-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.onnx");
+
+        let prefix = format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"onnx\"; filename=\"large.onnx\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        );
+        let suffix = format!("\r\n--{BOUNDARY}--\r\n");
+        let mut body = Vec::with_capacity(prefix.len() + MODEL_SIZE + suffix.len());
+        body.extend_from_slice(prefix.as_bytes());
+        body.resize(body.len() + MODEL_SIZE, 0x5a);
+        body.extend_from_slice(suffix.as_bytes());
+        let request_limit = body.len() + 1024;
+
+        async fn upload(
+            State(path): State<PathBuf>,
+            mut multipart: Multipart,
+        ) -> Result<StatusCode, ApiError> {
+            let field = multipart
+                .next_field()
+                .await
+                .map_err(|e| multipart_error("multipart", e))?
+                .ok_or((StatusCode::BAD_REQUEST, "missing field".into()))?;
+            write_onnx(field, &path).await?;
+            Ok(StatusCode::NO_CONTENT)
+        }
+
+        let app = Router::new()
+            .route(
+                "/upload",
+                post(upload).layer(DefaultBodyLimit::max(request_limit)),
+            )
+            .with_state(path.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={BOUNDARY}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), MODEL_SIZE as u64);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
