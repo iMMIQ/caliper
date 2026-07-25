@@ -4,10 +4,10 @@ use crate::state::AppState;
 use crate::store;
 use axum::{
     extract::{
-        multipart::{Field, MultipartError},
+        multipart::{Field, MultipartError, MultipartRejection},
         DefaultBodyLimit, Multipart, Path, State,
     },
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{sse::Event, sse::KeepAlive, sse::Sse, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -18,8 +18,10 @@ use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 
 const MAX_SPEC_BYTES: usize = 64 * 1024;
 
@@ -37,6 +39,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/jobs/:id/events", get(job_events))
         .route("/v1/jobs/:id/artifacts", get(list_artifacts))
         .route("/v1/jobs/:id/artifacts/:name", get(get_artifact))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
         .with_state(state)
 }
 
@@ -76,6 +83,13 @@ fn multipart_error(context: &str, error: MultipartError) -> ApiError {
     (error.status(), format!("{context}: {}", error.body_text()))
 }
 
+fn multipart_rejection_error(error: MultipartRejection) -> ApiError {
+    (
+        error.status(),
+        format!("multipart extractor: {}", error.body_text()),
+    )
+}
+
 async fn read_spec(mut field: Field<'_>) -> Result<String, ApiError> {
     let mut bytes = Vec::new();
     while let Some(chunk) = field
@@ -95,16 +109,20 @@ async fn read_spec(mut field: Field<'_>) -> Result<String, ApiError> {
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("spec 不是有效 UTF-8: {e}")))
 }
 
-async fn write_onnx(mut field: Field<'_>, path: &FsPath) -> Result<String, ApiError> {
+async fn write_onnx(mut field: Field<'_>, path: &FsPath) -> Result<(String, u64), ApiError> {
     let mut file = tokio::fs::File::create(path)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mut hasher = Sha256::new();
+    let mut size_bytes = 0u64;
     while let Some(chunk) = field
         .chunk()
         .await
         .map_err(|e| multipart_error("read onnx", e))?
     {
+        size_bytes = size_bytes
+            .checked_add(chunk.len() as u64)
+            .ok_or((StatusCode::PAYLOAD_TOO_LARGE, "ONNX 文件过大".into()))?;
         file.write_all(&chunk)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -114,17 +132,63 @@ async fn write_onnx(mut field: Field<'_>, path: &FsPath) -> Result<String, ApiEr
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     drop(file);
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect())
+    Ok((
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect(),
+        size_bytes,
+    ))
 }
 
 async fn create_job(
     State(state): State<Arc<AppState>>,
-    mut multipart: Multipart,
+    headers: HeaderMap,
+    multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let started = Instant::now();
+    let content_length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("<missing or invalid>");
+    tracing::info!(
+        request_id = %request_id,
+        content_length = ?content_length,
+        content_type,
+        max_upload_bytes = state.cfg.max_upload_bytes,
+        "收到模型上传请求"
+    );
+
+    let result = create_job_inner(state, multipart, &request_id).await;
+    match &result {
+        Ok(_) => tracing::info!(
+            request_id = %request_id,
+            elapsed_ms = started.elapsed().as_millis(),
+            "模型上传请求处理完成"
+        ),
+        Err((status, message)) => tracing::warn!(
+            request_id = %request_id,
+            status = status.as_u16(),
+            error = %message,
+            elapsed_ms = started.elapsed().as_millis(),
+            "模型上传请求失败"
+        ),
+    }
+    result
+}
+
+async fn create_job_inner(
+    state: Arc<AppState>,
+    multipart: Result<Multipart, MultipartRejection>,
+    request_id: &str,
+) -> Result<impl IntoResponse, ApiError> {
+    let mut multipart = multipart.map_err(multipart_rejection_error)?;
     let id = uuid::Uuid::new_v4().to_string();
     let workdir = store::job_dir(&state.storage, &id);
     std::fs::create_dir_all(&workdir)
@@ -154,10 +218,17 @@ async fn create_job(
                 }
                 onnx_name = field.file_name().map(|s| s.to_string());
                 let upload_path = workdir.join("model.onnx.uploading");
-                let hash = write_onnx(field, &upload_path).await?;
+                let (hash, size_bytes) = write_onnx(field, &upload_path).await?;
                 tokio::fs::rename(&upload_path, store::onnx_path(&workdir))
                     .await
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                tracing::info!(
+                    request_id,
+                    job_id = %id,
+                    filename = ?onnx_name,
+                    size_bytes,
+                    "ONNX 上传已落盘"
+                );
                 onnx_sha = Some(hash);
             }
             _ => { /* ignore unknown */ }
@@ -351,6 +422,35 @@ mod upload_tests {
     use super::*;
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn reports_multipart_extractor_rejection() {
+        async fn upload(
+            multipart: Result<Multipart, MultipartRejection>,
+        ) -> Result<StatusCode, ApiError> {
+            multipart.map_err(multipart_rejection_error)?;
+            Ok(StatusCode::NO_CONTENT)
+        }
+
+        let response = Router::new()
+            .route("/upload", post(upload))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Invalid `boundary`"));
+    }
 
     #[tokio::test]
     async fn accepts_and_streams_multipart_larger_than_axum_default() {
