@@ -2,52 +2,82 @@
 //! CANN 工具链相关项默认留空 → 运行时自动发现。
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "caliper", version, about = "Ascend ONNX 模型性能表征服务")]
+#[command(
+    name = "caliper",
+    version,
+    about = "Ascend ONNX model characterization service and CLI"
+)]
 pub struct Cli {
-    /// 配置文件路径
-    #[arg(long)]
+    #[command(subcommand)]
+    pub command: Option<CliCommand>,
+    /// Configuration file path
+    #[arg(long, global = true)]
     pub config: Option<PathBuf>,
-    /// 监听地址，如 0.0.0.0:7878
-    #[arg(long)]
+    /// Server listen address, for example 0.0.0.0:7878
+    #[arg(long, global = true)]
     pub bind: Option<String>,
-    /// multipart 上传请求上限（MiB）
-    #[arg(long = "max-upload-mib")]
+    /// Maximum multipart upload size in MiB
+    #[arg(long = "max-upload-mib", global = true)]
     pub max_upload_mib: Option<usize>,
-    /// 任务存储目录
-    #[arg(long)]
+    /// Job storage directory
+    #[arg(long, global = true)]
     pub storage: Option<PathBuf>,
-    /// 旧版兼容：只允许调度这一张设备
-    #[arg(long)]
+    /// Restrict scheduling to one device
+    #[arg(long, global = true)]
     pub device: Option<i32>,
-    /// 允许调度的设备 ID，逗号分隔；留空自动发现
-    #[arg(long, value_delimiter = ',')]
+    /// Comma-separated device IDs; auto-discover when omitted
+    #[arg(long, value_delimiter = ',', global = true)]
     pub devices: Option<Vec<i32>>,
-    /// 默认迭代次数
-    #[arg(long)]
+    /// Default benchmark iteration count
+    #[arg(long, global = true)]
     pub iters: Option<u32>,
-    /// 默认预热次数
-    #[arg(long)]
+    /// Default warmup iteration count
+    #[arg(long, global = true)]
     pub warmup: Option<u32>,
-    /// msprof 采样推理次数
-    #[arg(long = "msprof-iters")]
+    /// Inference count captured by msprof
+    #[arg(long = "msprof-iters", global = true)]
     pub msprof_iters: Option<u32>,
-    /// CANN 工具链根目录（覆盖自动发现）
-    #[arg(long = "cann-home")]
+    /// CANN toolkit root (overrides auto-discovery)
+    #[arg(long = "cann-home", global = true)]
     pub cann_home: Option<String>,
-    /// 目标 SoC（覆盖 npu-smi 推断）
-    #[arg(long = "soc-version")]
+    /// Target SoC (overrides npu-smi detection)
+    #[arg(long = "soc-version", global = true)]
     pub soc_version: Option<String>,
-    /// caliper-runner 可执行文件路径
-    #[arg(long)]
+    /// Path to the caliper-runner executable
+    #[arg(long, global = true)]
     pub runner: Option<PathBuf>,
-    /// libascendcl.so 路径（覆盖自动发现）
-    #[arg(long)]
+    /// Path to libascendcl.so (overrides auto-discovery)
+    #[arg(long, global = true)]
     pub libascendcl: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CliCommand {
+    /// Run one ONNX model synchronously and print the result
+    Run(RunArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct RunArgs {
+    /// Input ONNX file
+    pub onnx: PathBuf,
+    /// Dynamic input shape, for example input:1,3,224,224
+    #[arg(long = "input-shape")]
+    pub input_shape: Option<String>,
+    /// Additional ATC arguments
+    #[arg(long = "extra-atc-flags")]
+    pub extra_atc_flags: Option<String>,
+    /// Force compilation without reading or writing the compile cache
+    #[arg(long)]
+    pub no_cache: bool,
+    /// Output the complete job result as JSON (default: human-readable report)
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -294,5 +324,41 @@ mod tests {
 
         let config = Config::resolve(&cli).unwrap();
         assert_eq!(config.max_upload_bytes, 123 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parses_run_subcommand_and_global_run_options() {
+        let cli = Cli::try_parse_from([
+            "caliper",
+            "run",
+            "model.onnx",
+            "--iters",
+            "7",
+            "--device",
+            "2",
+            "--input-shape",
+            "images:1,3,224,224",
+            "--no-cache",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.iters, Some(7));
+        assert_eq!(cli.device, Some(2));
+        let Some(CliCommand::Run(run)) = cli.command else {
+            panic!("expected run subcommand");
+        };
+        assert_eq!(run.onnx, PathBuf::from("model.onnx"));
+        assert_eq!(run.input_shape.as_deref(), Some("images:1,3,224,224"));
+        assert!(run.no_cache);
+        assert!(!run.json);
+    }
+
+    #[test]
+    fn parses_explicit_json_output() {
+        let cli = Cli::try_parse_from(["caliper", "run", "model.onnx", "--json"]).unwrap();
+        let Some(CliCommand::Run(run)) = cli.command else {
+            panic!("expected run subcommand");
+        };
+        assert!(run.json);
     }
 }

@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
+use std::{fs::File, io::Read};
 use tokio::process::Command;
 
 pub async fn run_pipeline(state: Arc<AppState>, job_id: String) {
@@ -398,9 +399,24 @@ fn hex_sha256(bytes: &[u8]) -> String {
     h.finalize().iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
-    let data = std::fs::read(path).with_context(|| format!("读取文件失败: {}", path.display()))?;
-    Ok(hex_sha256(&data))
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path).with_context(|| format!("读取文件失败: {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .with_context(|| format!("读取文件失败: {}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 #[cfg(test)]
@@ -421,6 +437,21 @@ mod tests {
         std::fs::write(&pbtxt, b"graph").unwrap();
         collect_pbtxt(&dir, &mut files).unwrap();
         assert_eq!(files, vec![pbtxt]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hashes_a_file_without_loading_it_whole() {
+        let dir = test_dir("sha256");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.onnx");
+        std::fs::write(&path, b"abc").unwrap();
+
+        assert_eq!(
+            sha256_file(&path).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

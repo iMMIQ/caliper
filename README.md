@@ -72,6 +72,30 @@ curl -OJ http://127.0.0.1:7878/v1/jobs/<job_id>/artifacts/msprof.tar.gz
 curl -OJ http://127.0.0.1:7878/v1/jobs/<job_id>/artifacts/atc-pbtxt.tar.gz
 ```
 
+### CLI 单次执行
+
+不启动 HTTP 服务，直接输入一个 ONNX，同步复用服务端的 ATC、benchmark 和 msprof 流水线：
+
+```bash
+./target/release/caliper run model.onnx \
+  --device 0 \
+  --iters 100 \
+  --warmup 10 \
+  --msprof-iters 10
+```
+
+动态形状模型可增加 `--input-shape 'input:1,3,224,224'`；也支持
+`--soc-version`、`--extra-atc-flags` 和 `--no-cache`。成功后 stdout 默认输出便于直接阅读的
+英文分节报告；增加 `--json` 时输出完整的 `Job` JSON，其 `result` 与 `GET /v1/jobs/{id}` 相同。
+日志始终写入 stderr，进程失败时返回非零退出码，因此两种输出都可以安全重定向：
+
+```bash
+./target/release/caliper run model.onnx --device 0 > report.txt
+./target/release/caliper run model.onnx --device 0 --json | jq '.result.benchmark'
+```
+
+所有任务产物仍保存在 `storage/jobs/<job_id>/`，存储位置可用 `--storage` 或配置文件调整。
+
 上传请求默认上限为 10240 MiB（10 GiB），也可通过配置文件中的
 `server.max_upload_mib` 或命令行参数 `--max-upload-mib` 调整。ONNX 内容按分块写入磁盘，不会将
 整个模型保存在内存中；任务进入队列前，存储目录必须有足够空间容纳完整模型。
