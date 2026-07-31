@@ -4,6 +4,7 @@ mod api;
 mod cann;
 mod config;
 mod device;
+mod onnx;
 mod pipeline;
 mod report;
 mod state;
@@ -138,6 +139,18 @@ async fn run_once(
     let source = std::fs::canonicalize(&args.onnx)
         .map_err(anyhow::Error::from)
         .map_err(|error| anyhow::anyhow!("读取 ONNX 路径失败 {}: {error}", args.onnx.display()))?;
+    let spec = JobSpec {
+        soc_version: state.cfg.soc_version.clone(),
+        input_shape: args.input_shape,
+        iters: state.cfg.iters,
+        warmup: state.cfg.warmup,
+        device_id: requested_device,
+        msprof_iters: state.cfg.msprof_iters,
+        extra_atc_flags: args.extra_atc_flags,
+        no_cache: args.no_cache,
+    };
+    onnx::validate_input_shapes(&source, spec.input_shape.as_deref())?;
+
     let id = uuid::Uuid::new_v4().to_string();
     let workdir = store::job_dir(&state.storage, &id);
     std::fs::create_dir_all(&workdir)?;
@@ -154,16 +167,6 @@ async fn run_once(
         .file_name()
         .and_then(|name| name.to_str())
         .map(str::to_owned);
-    let spec = JobSpec {
-        soc_version: state.cfg.soc_version.clone(),
-        input_shape: args.input_shape,
-        iters: state.cfg.iters,
-        warmup: state.cfg.warmup,
-        device_id: requested_device,
-        msprof_iters: state.cfg.msprof_iters,
-        extra_atc_flags: args.extra_atc_flags,
-        no_cache: args.no_cache,
-    };
     write_cli_meta(&workdir, &id, &spec, onnx_name.as_deref(), &sha256)?;
 
     let now = chrono::Utc::now();

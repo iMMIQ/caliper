@@ -67,6 +67,12 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
         return Ok(());
     }
 
+    let onnx = store::onnx_path(&workdir);
+    state
+        .update_job(id, |job| job.stage = "校验 ONNX 输入 shape".into())
+        .await;
+    crate::onnx::validate_input_shapes(&onnx, spec.input_shape.as_deref())?;
+
     // 租约从选卡成功一直持有到 benchmark 和 msprof 全部结束。文件描述符关闭时
     // flock 由内核释放，因此正常返回、错误和进程崩溃都不会遗留死锁。
     let Some(lease) = acquire_device(&state, id, spec.device_id).await? else {
@@ -81,7 +87,6 @@ async fn run_inner(state: Arc<AppState>, id: &str) -> Result<()> {
         .or_else(|| crate::cann::infer_soc(dev))
         .unwrap_or_else(|| "Ascend310P3".to_string());
 
-    let onnx = store::onnx_path(&workdir);
     let om_base = store::om_base(&workdir);
     let om = store::om_path(&workdir);
     let atc_pbtxt_dir = store::atc_pbtxt_dir(&workdir);

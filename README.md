@@ -84,7 +84,8 @@ curl -OJ http://127.0.0.1:7878/v1/jobs/<job_id>/artifacts/atc-pbtxt.tar.gz
   --msprof-iters 10
 ```
 
-动态形状模型可增加 `--input-shape 'input:1,3,224,224'`；也支持
+动态形状模型必须增加 `--input-shape 'input:1,3,224,224'`；未覆盖的动态输入会在调用 ATC
+前直接报错。也支持
 `--soc-version`、`--extra-atc-flags` 和 `--no-cache`。成功后 stdout 默认输出便于直接阅读的
 英文分节报告；增加 `--json` 时输出完整的 `Job` JSON，其 `result` 与 `GET /v1/jobs/{id}` 相同。
 日志始终写入 stderr，进程失败时返回非零退出码，因此两种输出都可以安全重定向：

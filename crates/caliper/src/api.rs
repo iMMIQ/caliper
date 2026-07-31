@@ -237,6 +237,8 @@ async fn create_job_inner(
 
     let hash = onnx_sha.ok_or((StatusCode::BAD_REQUEST, "缺少 onnx 字段".into()))?;
     let spec = spec.unwrap_or_default();
+    crate::onnx::validate_input_shapes(&store::onnx_path(&workdir), spec.input_shape.as_deref())
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let meta = json!({"id": &id, "spec": &spec, "onnx_name": &onnx_name, "sha256": &hash});
     let _ = std::fs::write(
         store::meta_json(&workdir),
