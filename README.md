@@ -31,6 +31,47 @@ cargo build --release
 # 产物：target/release/caliper、caliper-runner 与 caliper-transfer
 ```
 
+## Docker
+
+Dockerfile 使用 Ubuntu 22.04 构建，并以轻量的 Debian bookworm-slim 作为运行镜像。基础镜像通过
+DaoCloud 拉取，系统包使用阿里云软件源，Rust 使用 rsproxy；构建过程不依赖境外源直连：
+
+```bash
+docker build -t caliper:local .
+```
+
+镜像不包含体积很大的 CANN 和 Ascend 驱动。仓库中的 `compose.yaml` 按当前常见的单卡安装布局
+挂载宿主机环境：
+
+```bash
+docker compose up -d --build
+docker compose logs -f caliper
+```
+
+| 宿主机路径 | 容器路径 | 用途 |
+| --- | --- | --- |
+| `/usr/local/Ascend` | `/usr/local/Ascend` | 必需；驱动库、CANN、ATC、msprof、ACL，并保留版本符号链接 |
+| `/usr/local/sbin/npu-smi` | 同路径 | 必需；设备发现、SoC 推断和空闲检查 |
+| `/etc/ascend_install.info` | 同路径 | 建议；让 CANN `set_env.sh` 定位驱动安装目录 |
+| `/usr/local/dcmi` | 同路径 | 建议；DCMI 设备管理组件 |
+| `/dev/davinci0` | 同路径 | 必需；示例分配的 NPU 设备 |
+| `/dev/davinci_manager` | 同路径 | 必需；Ascend 设备管理节点 |
+| `/dev/devmm_svm` | 同路径 | 必需；Ascend 共享虚拟内存节点 |
+| `/dev/hisi_hdc` | 同路径 | 必需；Host-Device 通信节点 |
+
+如果宿主机路径不同，可在 `.env` 中设置 `ASCEND_HOME`、`NPU_SMI_PATH`、
+`ASCEND_INSTALL_INFO` 和 `DCMI_HOME`。多卡时，在 `compose.yaml` 的 `devices` 中增加
+`/dev/davinci1` 等节点，并设置 `CALIPER_DEVICES=0,1,...`。缺少建议项时可删除对应挂载；设备节点
+则应按宿主机实际驱动安装情况调整。命名卷 `caliper-storage` 保存任务数据，
+`caliper-device-locks` 保存容器内的设备锁文件。
+
+仓库另有面向 8 卡 Ascend 310P 的 `compose.8npu.yaml`，默认映射 `/dev/davinci0` 至
+`/dev/davinci7`，并将调度池设置为全部 8 张卡：
+
+```bash
+docker compose -f compose.8npu.yaml up -d
+```
+
 ## H2D / D2H 传输时延实验
 
 `caliper-transfer` 单独测量 host 与 device 之间的同步传输，不需要 ONNX/OM。实验在计时前通过

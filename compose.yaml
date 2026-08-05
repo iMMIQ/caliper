@@ -1,0 +1,52 @@
+services:
+  caliper:
+    build:
+      context: .
+    image: caliper:local
+    container_name: caliper
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${CALIPER_PORT:-7878}:7878"
+    command:
+      - --cann-home
+      - /usr/local/Ascend/ascend-toolkit/latest
+      - --devices
+      - "${CALIPER_DEVICES:-0}"
+    devices:
+      - /dev/davinci0:/dev/davinci0
+      - /dev/davinci_manager:/dev/davinci_manager
+      - /dev/devmm_svm:/dev/devmm_svm
+      - /dev/hisi_hdc:/dev/hisi_hdc
+    volumes:
+      # 挂载整个目录以保留 cann、ascend-toolkit/latest 和版本目录之间的符号链接。
+      - type: bind
+        source: ${ASCEND_HOME:-/usr/local/Ascend}
+        target: /usr/local/Ascend
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${NPU_SMI_PATH:-/usr/local/sbin/npu-smi}
+        target: /usr/local/sbin/npu-smi
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ASCEND_INSTALL_INFO:-/etc/ascend_install.info}
+        target: /etc/ascend_install.info
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${DCMI_HOME:-/usr/local/dcmi}
+        target: /usr/local/dcmi
+        read_only: true
+        bind:
+          create_host_path: false
+      - caliper-storage:/app/storage
+      - caliper-device-locks:/tmp/caliper-device-locks
+
+volumes:
+  caliper-storage:
+  caliper-device-locks:

@@ -1,0 +1,56 @@
+services:
+  caliper:
+    image: caliper:0.1.0-arm64
+    container_name: caliper
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${CALIPER_PORT:-7878}:7878"
+    command:
+      - --cann-home
+      - /usr/local/Ascend/ascend-toolkit/latest
+      - --devices
+      - 0,1,2,3,4,5,6,7
+    devices:
+      - /dev/davinci0:/dev/davinci0
+      - /dev/davinci1:/dev/davinci1
+      - /dev/davinci2:/dev/davinci2
+      - /dev/davinci3:/dev/davinci3
+      - /dev/davinci4:/dev/davinci4
+      - /dev/davinci5:/dev/davinci5
+      - /dev/davinci6:/dev/davinci6
+      - /dev/davinci7:/dev/davinci7
+      - /dev/davinci_manager:/dev/davinci_manager
+      - /dev/devmm_svm:/dev/devmm_svm
+      - /dev/hisi_hdc:/dev/hisi_hdc
+    volumes:
+      - type: bind
+        source: ${ASCEND_HOME:-/usr/local/Ascend}
+        target: /usr/local/Ascend
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${NPU_SMI_PATH:-/usr/local/sbin/npu-smi}
+        target: /usr/local/sbin/npu-smi
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ASCEND_INSTALL_INFO:-/etc/ascend_install.info}
+        target: /etc/ascend_install.info
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${DCMI_HOME:-/usr/local/dcmi}
+        target: /usr/local/dcmi
+        read_only: true
+        bind:
+          create_host_path: false
+      - caliper-storage:/app/storage
+      - caliper-device-locks:/tmp/caliper-device-locks
+
+volumes:
+  caliper-storage:
+  caliper-device-locks:
