@@ -22,7 +22,7 @@ jobs:
             runner: ubuntu-24.04-arm
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Resolve version
         id: meta
@@ -86,7 +86,7 @@ jobs:
           xz -T0 -6 "$archive"
           xz --test "${archive}.xz"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.arch }}
           path: release/*.tar.xz
@@ -102,7 +102,7 @@ jobs:
       packages: write
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: dist
