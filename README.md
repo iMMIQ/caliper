@@ -72,6 +72,15 @@ docker compose logs -f caliper
 docker compose -f compose.8npu.yaml up -d
 ```
 
+推送 `v*` 标签时，GitHub Actions 会发布 amd64/arm64 的 Linux 二进制包、两个平台各自可由
+`docker load` 导入的 runtime 镜像包，并将多架构镜像发布到 `ghcr.io/immiq/caliper`。
+离线部署 arm64 镜像包：
+
+```bash
+xz -dc caliper-docker-0.1.0-linux-arm64.tar.xz | docker load
+docker compose -f compose.8npu.yaml up -d
+```
+
 ## H2D / D2H 传输时延实验
 
 `caliper-transfer` 单独测量 host 与 device 之间的同步传输，不需要 ONNX/OM。实验在计时前通过
