@@ -33,7 +33,8 @@ cargo build --release
 
 ## Docker
 
-Dockerfile 使用 Ubuntu 22.04 构建，并以轻量的 Debian bookworm-slim 作为运行镜像。基础镜像通过
+Dockerfile 使用 Ubuntu 22.04 构建，并以 Ubuntu 24.04 作为运行镜像。运行镜像自带 ATC/TBE
+所需的 Python 和开发组件，不挂载宿主机 Python。基础镜像通过
 DaoCloud 拉取，系统包使用阿里云软件源，Rust 使用 rsproxy；构建过程不依赖境外源直连：
 
 ```bash
@@ -41,7 +42,7 @@ docker build -t caliper:local .
 ```
 
 镜像不包含体积很大的 CANN 和 Ascend 驱动。仓库中的 `compose.yaml` 按当前常见的单卡安装布局
-挂载宿主机环境：
+挂载宿主机环境，并启用 CANN profiling 所需的特权模式：
 
 ```bash
 docker compose up -d --build
@@ -77,7 +78,7 @@ docker compose -f compose.8npu.yaml up -d
 离线部署 arm64 镜像包：
 
 ```bash
-xz -dc caliper-docker-0.1.0-linux-arm64.tar.xz | docker load
+xz -dc caliper-docker-0.1.1-linux-arm64.tar.xz | docker load
 docker compose -f compose.8npu.yaml up -d
 ```
 

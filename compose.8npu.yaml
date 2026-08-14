@@ -1,9 +1,11 @@
 services:
   caliper:
-    image: caliper:0.1.0-arm64
+    image: caliper:0.1.1-arm64
     container_name: caliper
     restart: unless-stopped
     init: true
+    # CANN/Ascend profiling accesses driver ioctls and shared device state.
+    privileged: true
     ports:
       - "${CALIPER_PORT:-7878}:7878"
     command:

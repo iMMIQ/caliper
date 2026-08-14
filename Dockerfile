@@ -46,17 +46,35 @@ RUN set -eux; \
         target/release/caliper-transfer
 
 
-FROM docker.m.daocloud.io/library/debian:bookworm-slim AS runtime
+FROM docker.m.daocloud.io/library/ubuntu:24.04 AS runtime
 
 RUN set -eux; \
-    sed -i \
-        -e 's@http://deb.debian.org/debian-security@http://mirrors.aliyun.com/debian-security@g' \
-        -e 's@http://deb.debian.org/debian@http://mirrors.aliyun.com/debian@g' \
-        /etc/apt/sources.list.d/debian.sources; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+        amd64) ubuntu_mirror="http://mirrors.aliyun.com/ubuntu" ;; \
+        arm64) ubuntu_mirror="http://mirrors.aliyun.com/ubuntu-ports" ;; \
+        *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    sed -i -E \
+        "s@https?://(archive.ubuntu.com|security.ubuntu.com)/ubuntu@${ubuntu_mirror}@g; s@https?://ports.ubuntu.com/ubuntu-ports@${ubuntu_mirror}@g" \
+        /etc/apt/sources.list.d/ubuntu.sources; \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        bash \
         libgomp1 \
-        libnuma1; \
+        libnuma1 \
+        libffi8 \
+        python3 \
+        python3-attr \
+        python3-decorator \
+        python3-dev \
+        python3-numpy \
+        python3-psutil \
+        python3-scipy \
+        python3-sympy; \
+    python3 --version; \
+    python3-config --prefix; \
+    python3 -c 'import attr, ctypes, decorator, numpy, psutil, scipy, sympy'; \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
